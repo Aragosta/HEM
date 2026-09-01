@@ -26,6 +26,24 @@ from helm.utils.train_util import (prepare_accelerator, prepare_data,
                                    save_checkpoint_both, save_checkpoint_euc)
 
 
+def resolve_rope_impl(args):
+    """Pick the rotary implementation that suits the execution mode.
+
+    The complex path has the faster eager kernel, but TorchInductor cannot lower
+    complex operators, so under ``torch.compile`` it falls back and drags the
+    surrounding fusion down with it. Measured on one block (CPU, seq 512):
+
+        eager    complex 37.5 ms | real 46.8 ms
+        compiled complex 34.8 ms | real 30.6 ms
+
+    So: complex when running eagerly, real when compiling. Pass ``--rope_impl``
+    explicitly to override.
+    """
+    if args.rope_impl != "auto":
+        return args.rope_impl
+    return "real" if args.compile else "complex"
+
+
 def sequence_balance_loss(scores: torch.Tensor, indices: torch.Tensor,
                           alpha: float) -> torch.Tensor:
     """DeepSeek-style auxiliary load-balancing loss for one MoE layer.
@@ -69,7 +87,7 @@ def build_model(args):
         return HelmMiCE(
             args, manifold_in, manifold_hidden, manifold_out,
             attn_impl=args.attn_impl,
-            rope_impl=args.rope_impl,
+            rope_impl=resolve_rope_impl(args),
             fuse_experts=args.fuse_experts,
             fuse_residual=args.fuse_residual,
             grad_checkpoint=args.grad_checkpoint,
@@ -100,7 +118,7 @@ def train(args, tokenizer):
     decoder = build_model(args)
     is_mice = args.model_name == "HELM_MiCE"
     print(f"Total parameters: {sum(p.numel() for p in decoder.parameters()):,}")
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)  # HELM-D path only
 
     train_dataloader = prepare_data(tokenizer, args)
     print("Dataset loaded and DataLoader prepared.")
@@ -140,11 +158,16 @@ def train(args, tokenizer):
         block_mask = ~(seq_ids.unsqueeze(1) == seq_ids.unsqueeze(2))
         with accelerator.accumulate(decoder):
             if is_mice:
-                logits, indices_list, scores_list = decoder(batch["input_ids"],
-                                                            attn_mask=block_mask)
+                # `labels=` runs the fused head: the (batch, seq, vocab) logit
+                # tensor -- 3.9 GiB at the released shape -- is never built, and
+                # ignored positions skip the projection entirely.
+                loss, indices_list, scores_list = decoder(
+                    batch["input_ids"], attn_mask=block_mask,
+                    labels=batch["labels"], ce_chunk_size=args.ce_chunk_size)
             else:
                 logits = decoder(batch["input_ids"], attn_mask=block_mask)
-            loss = loss_fn(logits.view(-1, logits.size(-1)), batch["labels"].view(-1))
+                loss = loss_fn(logits.view(-1, logits.size(-1)),
+                               batch["labels"].view(-1))
 
             if is_mice and indices_list:
                 balance = torch.stack([

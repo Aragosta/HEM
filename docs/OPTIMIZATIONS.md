@@ -111,7 +111,10 @@ Whole model, 126M params, 6 layers, batch 2, same conditions:
 | --- | --- | --- | --- |
 | forward, seq 1024 | 1752.7 ms | 1367.1 ms | **1.28×** |
 | forward, seq 2048 | 4058.0 ms | 3015.5 ms | **1.35×** |
-| forward + backward, seq 1024 | 8916.5 ms | 7341.1 ms | **1.21×** |
+| **full training step, seq 1024** | **11887 ms / 7045 MiB** | **5697 ms / 3518 MiB** | **2.09× / 2.0× less memory** |
+
+The training step is where the fused head lands, which is why it gains far more
+than the forward pass alone.
 
 Verified **bit-exact** against the reference when matched for softmax precision
 and rotary path (`test_hmla_naive_complex_is_bit_exact`), and gradient-matched
@@ -177,6 +180,46 @@ where four suffice:
 `helm/modules/lorentz_ops.py::LorentzResidual` is a drop-in replacement with an
 identical state dict. **Measured: 7.48 ms → 5.39 ms (1.39×)** at the 120M shape,
 seq 2048; agreement with `LResNet` is 7e-15 in float64, gradients included.
+
+## 3c. The language-model head, which turned out to be the biggest win
+
+HELM-MiCE has an unusually lopsided head. The released 120M configuration pairs
+`dim = 390` with a 128256-entry Llama-3 vocabulary, so:
+
+* `head` alone is **50M of the model's 107M parameters** (the embedding is
+  another 50M; the six transformer layers share the remaining 7M);
+* its GEMM outweighs every transformer layer combined — profiling a two-layer
+  model put **81% of the forward pass** in the head;
+* `self.head(h).float()` materialises `(batch, seq, vocab)` in float32, which at
+  the released training shape (batch 4, 2048 tokens) is **3.9 GiB**, held live
+  through the backward pass, for a model whose weights are 0.4 GiB.
+
+`helm/modules/fused_ce.py` never builds it. Pass `labels=` to the model and it
+
+* **drops ignored positions before the GEMM.** Sequence packing leaves a real
+  fraction of positions carrying `ignore_index`; the reference computes 128256
+  logits for each one and discards the row. A pure FLOP saving proportional to
+  that fraction.
+* **chunks over the remaining tokens**, so the largest live logit block is
+  `chunk_size x vocab`.
+* **recomputes the logits in the backward pass** rather than storing them —
+  one extra GEMM in exchange for the entire activation.
+
+The arithmetic is unchanged: logits are still promoted to float32 before the
+softmax, exactly as `.float()` did. The running loss total is kept in float64
+(it is a scalar, so the precision is free), which makes the result *exactly*
+independent of `chunk_size` rather than merely close.
+
+**Measured** (CPU, fp32, `dim=390`, `vocab=128256`, batch 2 x 1024 tokens, 14%
+ignored):
+
+| | fwd + bwd | peak RSS |
+| --- | --- | --- |
+| `head(h).float()` then `cross_entropy` | 5060 ms | 3740 MiB |
+| fused, `chunk_size=256` | **2715 ms (1.86×)** | **1348 MiB (2.8× less)** |
+
+Gradients match the reference to 6e-08; the loss to 5e-07 (float32 summation
+order, and the fused version is the more accurate of the two).
 
 ## 4. Rotary embeddings: an honest non-result
 
@@ -244,6 +287,23 @@ language model also imported the graph-learning stack (`torch_geometric`,
 resolve lazily (`helm/_lazy.py`); the attribute surface is unchanged.
 
 ---
+
+## Measured and rejected
+
+Two changes that looked worthwhile and were not. Both were implemented and timed
+before being dropped, rather than reasoned about:
+
+* **Skipping the embedding's redundant permutes.** `LorentzEmbeddings.forward`
+  does `permute(1, 0).contiguous()`, an `index_select`, then `permute(1, 0, 2)`
+  back, none of which the `posit_embed=False` path needs. Removing them: 5.30 ms
+  → 5.15 ms (1.03×). The `index_select` over a 128256 x 390 table dominates
+  completely; the permutes are noise.
+* **Fusing the `wq` and `wkv_a` projections.** They consume the same input, so
+  they are one concatenated GEMM in the same way `w1`/`w3` are. Measured on the
+  GEMM pair alone: 6.08 ms → 5.59 ms (1.09×), which is a fraction of a fraction
+  of the block, and it would cost another pair of state-dict translation hooks.
+  Not worth the complexity here — though it is a better trade on a GPU, where
+  the win is launch overhead rather than arithmetic.
 
 ## What is *not* faster
 

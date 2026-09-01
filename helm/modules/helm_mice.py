@@ -15,6 +15,10 @@ This is the optimized assembly of :mod:`helm.modules.hmla` and
   soon as ``.eval()`` is called (see :class:`helm.modules.mice.Gate`).
 * **A fused Lorentz residual** (:class:`helm.modules.lorentz_ops.LorentzResidual`),
   which is where a surprising amount of the non-GEMM time goes.
+* **A fused language-model head** (``labels=...``). ``dim=390`` against a
+  128256-entry vocabulary makes ``head`` half the parameters and most of the
+  forward pass, and ``head(h).float()`` materialises 3.9 GiB of logits at the
+  released training shape. See :mod:`helm.modules.fused_ce`.
 * **Optional activation checkpointing** (``--grad_checkpoint``), which trades
   ~30% recompute for a large activation saving and usually buys back more than
   it costs by allowing a bigger micro-batch.
@@ -41,6 +45,7 @@ from helm.hypercore.nn.attention.lorentz_word_emb import LorentzEmbeddings
 from helm.hypercore.nn.conv.conv_util_layers import LResNet, LorentzRMSNorm
 from helm.hypercore.nn.linear.lorentz_linear import LorentzLinear
 
+from .fused_ce import fused_linear_cross_entropy
 from .hmla import LorentzKVCache, LorentzMLA
 from .lorentz_ops import LorentzResidual
 from .mice import LorentzMoE, LorentzSwiGLU
@@ -185,7 +190,9 @@ class HelmMiCE(nn.Module):
 
     def forward(self, tokens: torch.Tensor, start_pos: int = 0,
                 attn_mask: Optional[torch.Tensor] = None,
-                caches: Optional[List[LorentzKVCache]] = None):
+                caches: Optional[List[LorentzKVCache]] = None,
+                labels: Optional[torch.Tensor] = None,
+                ce_chunk_size: int = 512):
         """
         Args:
             tokens: ``(B, N)`` token ids.
@@ -194,9 +201,15 @@ class HelmMiCE(nn.Module):
                 "different document" mask produced by sequence packing. When
                 ``None``, a pure causal mask is applied without materialising it.
             caches: per-layer KV caches for incremental decoding.
+            labels: when given, the cross-entropy loss is returned in place of
+                the logits and computed without ever building them -- see
+                :mod:`helm.modules.fused_ce`. Positions set to ``-100`` are
+                skipped, including in the projection itself.
+            ce_chunk_size: tokens per block in the fused head.
 
         Returns:
-            ``logits``, or ``(logits, indices, scores)`` while training.
+            ``logits`` (or ``loss`` if ``labels`` is given), plus
+            ``(indices, scores)`` while training.
         """
         seqlen = tokens.size(-1)
         h = self.project(self.embed(tokens)) if self.project_emb else self.embed(tokens)
@@ -227,13 +240,20 @@ class HelmMiCE(nn.Module):
                     all_indices.append(idx)
                     all_scores.append(scr)
             h = self.norm(self.final_proj(h, return_space=True), space_only=True)
-            return self.head(h).float(), all_indices, all_scores
+            return self._head(h, labels, ce_chunk_size), all_indices, all_scores
 
         for i, layer in enumerate(self.layers):
             cache = caches[i] if caches is not None else None
             h = layer(h, start_pos, freqs_cis, mask, is_causal, cache)
         h = self.norm(self.final_proj(h, return_space=True), space_only=True)
-        return self.head(h).float()
+        return self._head(h, labels, ce_chunk_size)
+
+    def _head(self, h, labels, ce_chunk_size):
+        if labels is None:
+            return self.head(h).float()
+        return fused_linear_cross_entropy(h, self.head.weight, labels,
+                                          bias=self.head.bias,
+                                          chunk_size=ce_chunk_size)
 
 
 # Upstream calls the model `LorentzDeepSeekV3`; keep the name importable so that

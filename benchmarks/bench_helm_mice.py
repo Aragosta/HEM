@@ -184,11 +184,23 @@ def bench_model(args, cli, device, dtype):
     ref.train()
     fast.train()
 
-    def step(model, **kw):
+    labels = tokens.roll(-1, 1).clone()
+    labels[:, -1] = -100
+    labels[labels % 7 == 0] = -100          # what sequence packing produces
+
+    def step(model, fused_head=False):
+        """One training step: forward, cross-entropy, backward."""
         def run():
             model.zero_grad(set_to_none=True)
-            logits = model(tokens, **kw)[0]
-            logits.float().square().mean().backward()
+            if fused_head:
+                loss = model(tokens, labels=labels,
+                             ce_chunk_size=cli.ce_chunk_size)[0]
+            else:
+                logits = model(tokens)[0]
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)), labels.reshape(-1),
+                    ignore_index=-100)
+            loss.backward()
         return run
 
     def fwd(model, **kw):
@@ -202,8 +214,8 @@ def bench_model(args, cli, device, dtype):
     report("forward (train mode)", t_ref, t_fast, m_ref, m_fast, b * n)
 
     t_ref, m_ref = timeit(step(ref), device, cli.warmup, cli.iters)
-    t_fast, m_fast = timeit(step(fast), device, cli.warmup, cli.iters)
-    report("forward + backward", t_ref, t_fast, m_ref, m_fast, b * n)
+    t_fast, m_fast = timeit(step(fast, fused_head=True), device, cli.warmup, cli.iters)
+    report("training step", t_ref, t_fast, m_ref, m_fast, b * n)
 
     if cli.profile:
         (o_r, p_r), (o_f, p_f) = count_ops(step(ref)), count_ops(step(fast))
@@ -222,6 +234,7 @@ def main():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--component", default="all", choices=["all", "attention", "model"])
     p.add_argument("--grad-checkpoint", action="store_true")
+    p.add_argument("--ce-chunk-size", type=int, default=512)
     p.add_argument("--profile", action="store_true",
                    help="also report dispatched op counts and peak allocation")
     p.add_argument("--warmup", type=int, default=2)

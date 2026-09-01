@@ -82,10 +82,11 @@ accelerate launch --mixed_precision bf16 train.py \
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `--attn_impl` | `flash` | `flash` fuses the hyperbolic scores into `scaled_dot_product_attention`; `naive` is the literal published formulation |
-| `--rope_impl` | `complex` | `complex` is faster in eager; `real` is the one Inductor can fuse |
+| `--rope_impl` | `auto` | `complex` in eager, `real` under `torch.compile` — measured, they invert |
 | `--fuse_experts` | `True` | One GEMM for the SwiGLU gate/up projections instead of two |
 | `--grad_checkpoint` | `False` | Recompute block activations in the backward pass |
-| `--compile` | `False` | Wrap the model in `torch.compile` |
+| `--compile` | `False` | Wrap the model in `torch.compile` (with the real rope, 1.53× on a block) |
+| `--ce_chunk_size` | `512` | Tokens per block in the fused head |
 | `--balance_update` | `True` | Apply the auxiliary-loss-free routing-bias update (dead code upstream) |
 
 ## Results
@@ -99,10 +100,14 @@ kernel, so these are *lower* bounds:
 | attention, seq 2048 | 363.9 ms | 233.1 ms | **1.56×** |
 | whole model forward, seq 1024 | 1752.7 ms | 1367.1 ms | **1.28×** |
 | whole model forward, seq 2048 | 4058.0 ms | 3015.5 ms | **1.35×** |
-| whole model fwd+bwd, seq 1024 | 8916.5 ms | 7341.1 ms | **1.21×** |
+| **full training step, seq 1024** | **11.9 s / 7045 MiB** | **5.7 s / 3518 MiB** | **2.09× / 2.0× less memory** |
 
-Attention peak allocation roughly halves (384 → 195 MiB at seq 2048), because
-the `(B, H, N, N)` score matrix is never built.
+Two things drive the training-step number. Attention never builds its
+`(B, H, N, N)` score matrix, so its peak allocation roughly halves (384 → 195 MiB
+at seq 2048). And the LM head — 50M of the model's 107M parameters, because
+`dim=390` meets a 128256-entry vocabulary — no longer materialises **3.9 GiB** of
+float32 logits; `labels=` runs a chunked fused cross-entropy that also skips the
+padded positions before the projection instead of after.
 
 Two wins here are **unmeasured**, because this was developed on a CPU-only
 machine: eliminating the MoE's per-expert device syncs needs an asynchronous
@@ -119,7 +124,7 @@ python benchmarks/bench_helm_mice.py --preset 120m --seq-len 2048 --dtype bfloat
 Yes — and the tests are built to demonstrate it rather than assert it.
 
 ```bash
-python -m pytest tests/ -q       # 48 tests
+python -m pytest tests/ -q       # 55 tests
 ```
 
 * **Turn every rewrite off and it is bit-identical.** `attn_impl="naive"`,

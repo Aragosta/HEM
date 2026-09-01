@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from helm.hypercore.manifolds import Lorentz  # noqa: E402
 from helm.modules.helm_mice import HelmMiCE  # noqa: E402
 from helm.modules.hmla import LorentzMLA  # noqa: E402
+from helm.modules.fused_ce import fused_linear_cross_entropy  # noqa: E402
 from helm.modules.lorentz_ops import LorentzResidual  # noqa: E402
 from helm.modules.mice import LorentzMoE  # noqa: E402
 from helm.modules.rope import (apply_rotary_emb, apply_rotary_emb_real,  # noqa: E402
@@ -417,3 +418,88 @@ def test_exact_configuration_is_bit_identical():
     assert torch.equal(ref_logits, fast_logits)
     assert all(torch.equal(a, b) for a, b in zip(ref_idx, fast_idx))
     assert all(torch.equal(a, b) for a, b in zip(ref_scores, fast_scores))
+
+
+# ------------------------------------------------------------------ fused head
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_fused_cross_entropy_matches_reference(dtype, use_bias):
+    """Fused head == materialising logits, casting to fp32, and taking CE."""
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    batch, seqlen, dim, vocab = 2, 40, 16, 97
+    hidden = torch.randn(batch, seqlen, dim, dtype=dtype, requires_grad=True)
+    weight = torch.randn(vocab, dim, dtype=dtype, requires_grad=True)
+    bias = torch.randn(vocab, dtype=dtype, requires_grad=True) if use_bias else None
+
+    target = torch.randint(0, vocab, (batch, seqlen))
+    target[:, -1] = -100                    # shifted-label padding
+    target[target % 5 == 0] = -100          # sequence-packing gaps
+
+    reference = F.cross_entropy(
+        F.linear(hidden, weight, bias).float().reshape(-1, vocab),
+        target.reshape(-1), ignore_index=-100)
+    fused = fused_linear_cross_entropy(hidden, weight, target, bias, chunk_size=7)
+
+    torch.testing.assert_close(fused, reference.float(), rtol=1e-6, atol=1e-6)
+
+    inputs = [hidden, weight] + ([bias] if use_bias else [])
+    for got, want in zip(torch.autograd.grad(fused, inputs),
+                         torch.autograd.grad(reference, inputs)):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+
+def test_fused_cross_entropy_chunk_size_is_irrelevant():
+    """Chunking is a scheduling choice; it must not change the answer."""
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 33, 16, dtype=torch.float64)
+    weight = torch.randn(97, 16, dtype=torch.float64)
+    target = torch.randint(0, 97, (2, 33))
+    losses = [fused_linear_cross_entropy(hidden, weight, target, chunk_size=c).item()
+              for c in (1, 7, 32, 4096)]
+    assert max(losses) - min(losses) == 0.0, losses
+
+
+def test_fused_cross_entropy_all_ignored():
+    """A fully-masked batch yields zero loss, not a NaN from dividing by zero."""
+    hidden = torch.randn(2, 4, 8, requires_grad=True)
+    weight = torch.randn(5, 8, requires_grad=True)
+    loss = fused_linear_cross_entropy(hidden, weight, torch.full((2, 4), -100))
+    assert loss.item() == 0.0 and torch.isfinite(loss)
+
+
+def test_model_fused_head_matches_logits_path():
+    """The model's ``labels=`` path must equal logits + CrossEntropyLoss."""
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    args = tiny_args()
+    model = HelmMiCE(args, Lorentz(1.0), Lorentz(1.0), Lorentz(1.0)).double()
+    tokens = torch.randint(0, args.vocab_size, (2, 24))
+    labels = tokens.roll(-1, 1).clone()
+    labels[:, -1] = -100
+    labels[labels % 5 == 0] = -100
+    model.train()
+
+    logits, _, _ = model(tokens)
+    reference = F.cross_entropy(logits.reshape(-1, args.vocab_size),
+                                labels.reshape(-1), ignore_index=-100)
+    model.zero_grad()
+    reference.backward()
+    ref_grads = {n: p.grad.clone() for n, p in model.named_parameters()
+                 if p.grad is not None}
+
+    fused, _, _ = model(tokens, labels=labels)
+    model.zero_grad()
+    fused.backward()
+    fused_grads = {n: p.grad.clone() for n, p in model.named_parameters()
+                   if p.grad is not None}
+
+    torch.testing.assert_close(fused, reference.float(), rtol=1e-6, atol=1e-6)
+    assert set(ref_grads) == set(fused_grads)
+    for name in ref_grads:
+        torch.testing.assert_close(fused_grads[name], ref_grads[name],
+                                   rtol=1e-5, atol=1e-6,
+                                   msg=lambda m, n=name: f"{n}: {m}")

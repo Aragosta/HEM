@@ -28,7 +28,8 @@ config_args = {
     },
     'optimization_config': {
         'attn_impl': ('flash', "'flash' fuses the hyperbolic scores into scaled_dot_product_attention; 'naive' is the literal published formulation"),
-        'rope_impl': ('complex', "'complex' (faster eager) or 'real' (fusable under torch.compile)"),
+        'rope_impl': ('auto', "'auto' picks complex for eager and real for torch.compile; or force 'complex'/'real'"),
+        'ce_chunk_size': (512, 'tokens per block in the fused head; peak logit memory is ce_chunk_size x vocab x 4 bytes'),
         'fuse_experts': (True, 'fuse the SwiGLU gate/up projections of each expert into one GEMM'),
         'fuse_residual': (True, 'use the fused Lorentz residual instead of LResNet'),
         'grad_checkpoint': (False, 'recompute block activations in the backward pass to trade compute for memory'),
