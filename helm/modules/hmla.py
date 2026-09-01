@@ -91,10 +91,11 @@ class LorentzMLA(nn.Module):
         attn_impl: ``"flash"`` for the fused SDPA path (default), or ``"naive"``
             for the literal upstream formulation. Both produce the same result;
             ``"naive"`` exists to make the equivalence testable.
-        rope_impl: ``"real"`` (default) or ``"complex"``.
+        rope_impl: ``"complex"`` (default, faster in eager) or ``"real"``
+            (fusable under ``torch.compile``). See :mod:`helm.modules.rope`.
     """
 
-    def __init__(self, manifold, args, attn_impl: str = "flash", rope_impl: str = "real"):
+    def __init__(self, manifold, args, attn_impl: str = "flash", rope_impl: str = "complex"):
         super().__init__()
         if attn_impl not in ("flash", "naive"):
             raise ValueError(f"attn_impl must be 'flash' or 'naive', got {attn_impl!r}")

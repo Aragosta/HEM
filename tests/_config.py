@@ -58,7 +58,7 @@ def tiny_args(**overrides):
 
 def bench_args(**overrides):
     """The released 120M HELM-MiCE shape (``example/train_mice_120M.sh``)."""
-    return tiny_args(
+    defaults = dict(
         max_batch_size=4,
         max_seq_len=2048,
         original_seq_len=2048,
@@ -75,5 +75,6 @@ def bench_args(**overrides):
         qk_nope_head_dim=33,
         qk_rope_head_dim=17,
         v_head_dim=33,
-        **overrides,
     )
+    defaults.update(overrides)
+    return tiny_args(**defaults)

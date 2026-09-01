@@ -1,4 +1,5 @@
 import argparse
+import sys
 
 from .utils import add_flags_from_config
 
@@ -16,16 +17,32 @@ config_args = {
         'log_dir': ('../log', 'where to log training dynamics'),
         'data_path': ('../data', 'path to data'),
         'model_name': ('HELM_MiCE', 'One of HELM_D or HELM_MiCE'),
-        'find_unused_parameters': (True, 'whether the accelerator should find unused parameters'),
+        # DDP's unused-parameter search walks the autograd graph on every backward
+        # pass; it is a real throughput cost and is not needed here, because every
+        # expert receives a gradient through the shared routing weights.
+        'find_unused_parameters': (False, 'whether the accelerator should find unused parameters'),
         'max_batch_size': (1, 'Maximum batch size'),
         'max_seq_len': (2048, 'Maximum sequence length'),
-        'project_emb': (0, 'If true, the model will map tokens to space-like dimension of Lorentz vectors'),
+        'project_emb': (False, 'If true, the model will map tokens to space-like dimension of Lorentz vectors'),
         'vocab_size': (128256, 'Vocabulary size of the tokenizer')
+    },
+    'optimization_config': {
+        'attn_impl': ('flash', "'flash' fuses the hyperbolic scores into scaled_dot_product_attention; 'naive' is the literal published formulation"),
+        'rope_impl': ('complex', "'complex' (faster eager) or 'real' (fusable under torch.compile)"),
+        'fuse_experts': (True, 'fuse the SwiGLU gate/up projections of each expert into one GEMM'),
+        'grad_checkpoint': (False, 'recompute block activations in the backward pass to trade compute for memory'),
+        'compile': (False, 'wrap the model in torch.compile'),
+        'balance_update': (True, 'apply the auxiliary-loss-free routing-bias update each optimizer step'),
     },
     'model_config':{
         'dim': (910, 'Model dimension'),
         'inter_dim': (3640, 'Intermediate dimension for MLP layers'),
+        # The model reads `moe_inter_dim`; the released config only defined
+        # `mice_inter_dim`, so building HELM-MiCE from its own config raised
+        # AttributeError and every example/train_mice_*.sh crashed on startup.
+        # Both names are accepted now and reconciled in HelmArgumentParser.
         'mice_inter_dim': (1820, 'Intermediate dimension for MiCE layers'),
+        'moe_inter_dim': (None, 'Alias for mice_inter_dim; defaults to it when unset'),
         'n_layers': (16, 'Number of transformer layers'),
         'n_dense_layers': (1, 'Number of dense layers in the model'),
         'n_heads': (14, 'Number of attention heads'),
@@ -39,7 +56,7 @@ config_args = {
         'route_scale':(1., 'Scaling factor for routing scores'),
         'bias_update_speed':(0.005, 'How much to update the bias for gating to ensure expert load balancing'),
         'seq_bal_alpha': (1e-4, 'Scaling for sequence load balancing loss'),
-        'train_curv': (1, 'If true, sets the curvatures of the experts as trainable'),
+        'train_curv': (True, 'If true, sets the curvatures of the experts as trainable'),
         # hmla
         'q_lora_rank': (0, 'LoRA rank for query projections'),
         'kv_lora_rank': (257, 'LoRA rank for key-value projections'),
@@ -57,6 +74,26 @@ config_args = {
     }
 }
 
-parser = argparse.ArgumentParser()
+def reconcile(args):
+    """Fill in derived/aliased options after parsing."""
+    if getattr(args, "moe_inter_dim", None) is None:
+        args.moe_inter_dim = args.mice_inter_dim
+    elif "--mice_inter_dim" not in " ".join(sys.argv):
+        args.mice_inter_dim = args.moe_inter_dim
+    return args
+
+
+class HelmArgumentParser(argparse.ArgumentParser):
+    """Parser that reconciles the mice_inter_dim / moe_inter_dim split."""
+
+    def parse_args(self, args=None, namespace=None):
+        return reconcile(super().parse_args(args, namespace))
+
+    def parse_known_args(self, args=None, namespace=None):
+        parsed, extras = super().parse_known_args(args, namespace)
+        return reconcile(parsed), extras
+
+
+parser = HelmArgumentParser()
 for _, config_dict in config_args.items():
     parser = add_flags_from_config(parser, config_dict)

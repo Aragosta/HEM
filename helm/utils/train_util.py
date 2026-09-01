@@ -3,6 +3,7 @@ from datasets import load_from_disk
 from torch.optim.lr_scheduler import LambdaLR
 import os
 import torch
+import torch.nn.functional as F  # used by the collator's label shifting
 from llmfoundry.data.packing import BinPackCollator
 from torch.utils.data import DataLoader  
 from helm.hypercore.optimizers import Optimizer

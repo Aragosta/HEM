@@ -3,20 +3,32 @@
 Two interchangeable implementations of the *same* rotation:
 
 ``apply_rotary_emb``
-    The upstream ``torch.view_as_complex`` formulation, kept verbatim as the
-    reference.
+    The upstream ``torch.view_as_complex`` formulation.
 
 ``apply_rotary_emb_real``
     A real-arithmetic equivalent driven by a precomputed ``(cos, sin)`` table.
 
-The real path is preferred because the complex one is expensive and opaque:
-``x.float().contiguous()`` materialises a full fp32 copy of the tensor, the
-complex multiply is a separate kernel, and ``view_as_real(...).flatten(3)``
-forces yet another copy before the cast back to bf16 -- three full round trips
-through memory for what is six elementwise ops. More importantly, TorchInductor
-has no lowering for complex tensors, so a single ``view_as_complex`` in the
-attention block silently forces a graph break and de-optimises the whole layer
-under ``torch.compile``. The real formulation fuses into one kernel.
+Measured (CPU, fp32, 4x2048x14x64):
+
+    eager      complex  1.68 ms    real  28.13 ms
+    compiled   complex  1.23 ms    real   1.59 ms
+
+The complex path wins, so it is the **default**. Its eager kernel is well
+optimized, and the strided ``x[..., 0::2]`` views the real formulation needs are
+what make the latter slow outside a compiler that can fuse them away.
+
+The real path is kept, and worth selecting, for two reasons:
+
+* TorchInductor has no lowering for complex operators -- it emits
+  "does not support code generation for complex operators. Performance may be
+  worse than eager" and falls back -- so under ``torch.compile`` the real path is
+  the one that actually fuses. It did not win that comparison on CPU, but it is
+  the only path that can fuse into surrounding kernels on a GPU.
+* A complex buffer cannot survive ``module.to(dtype)``: casting to any real
+  dtype discards the imaginary part and silently degrades rotary embeddings to a
+  cosine rescale. :class:`helm.modules.helm_mice.HelmMiCE` protects the table
+  either way (see its ``_apply``), but the real layout is not a trap to begin
+  with.
 
 Both use the *interleaved* pair convention -- ``(x[..., 0], x[..., 1])`` form the
 first complex number, ``(x[..., 2], x[..., 3])`` the second -- because that is

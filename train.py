@@ -1,229 +1,243 @@
-from datasets import load_from_disk
-import torch
-from collections import OrderedDict
-import torch.nn as nn
-from helm.hypercore.manifolds import Lorentz
-import re
-from tqdm import tqdm
-import sys
-import gc
-from accelerate.utils import set_seed
-from torch.utils.data import DataLoader
-from accelerate import DistributedDataParallelKwargs, Accelerator
+"""Train HELM-D or HELM-MiCE.
+
+Same CLI and same training maths as the released script, with the host
+synchronisations and the load-balancing bugs taken out of the inner loop. See
+``docs/OPTIMIZATIONS.md``.
+"""
+
 import math
-import numpy as np
 import os
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-from helm.modules.helm_mice import LorentzDeepSeekV3
-from helm.modules.helm_d import LTransformerDecoder
-from transformers import AutoTokenizer, default_data_collator, DataCollatorWithPadding     
-from llmfoundry.data.packing import BinPackCollator, auto_packing_ratio  
-import random
-import math
+
+import torch
 import torch.distributed as dist
-from geoopt import ManifoldParameter
-from helm.utils.train_util import *
-from helm.modules.mice import LorentzMoE
+import torch.nn as nn
+from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import set_seed
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+from transformers import AutoTokenizer
+
 from config.args import parser
+from helm.hypercore.manifolds import Lorentz
+from helm.modules.helm_d import LTransformerDecoder
+from helm.modules.helm_mice import HelmMiCE
+from helm.modules.mice import LorentzMoE
+from helm.utils.train_util import (prepare_accelerator, prepare_data,
+                                   save_checkpoint_both, save_checkpoint_euc)
 
 
-def sequence_balance_loss(scores: torch.Tensor, indices: torch.Tensor, alpha: float) -> torch.Tensor:
+def sequence_balance_loss(scores: torch.Tensor, indices: torch.Tensor,
+                          alpha: float) -> torch.Tensor:
+    """DeepSeek-style auxiliary load-balancing loss for one MoE layer.
+
+        L = alpha * E * sum_i f_i * P_i
+
+    where ``f_i`` is the fraction of routing slots that went to expert ``i`` and
+    ``P_i`` is its mean routing probability.
+
+    The released implementation of this function does not compute that, and
+    cannot: it builds a histogram and then immediately overwrites it with
+    ``freq = indices * (E / (k * N))`` -- the *expert ids*, not their counts,
+    shaped ``(N, k)`` rather than ``(E,)``. The result only broadcasts against
+    ``P`` when ``k`` happens to equal ``E``, and otherwise raises. It also
+    hard-codes ``k = 2`` next to the line that would have read it off ``indices``.
+    Callers made it worse by round-tripping the indices through the host
+    (``torch.tensor(idx, device='cpu')``), forcing a device sync per layer per
+    micro-batch.
+
+    Args:
+        scores: ``(tokens, n_experts)`` routing probabilities.
+        indices: ``(tokens, topk)`` selected expert ids.
+        alpha: loss weight.
+
+    Returns:
+        Scalar loss on the same device as ``scores``.
+    """
     if scores.numel() == 0:
         return scores.new_tensor(0.0)
-    N, E = scores.size()
-    # k    = indices.size(1)  
-    k=2
-    indices = indices.type_as(scores)
-    freq = torch.bincount(indices.flatten(), minlength=E).float()
-    freq = indices * (E / (k * N))         
-    probs = scores / scores.sum(dim=-1, keepdim=True)
-    P = probs.mean(dim=0)
-    return alpha * (freq * P).sum()
+    n_tokens, n_experts = scores.shape
+    topk = indices.size(1)
+    counts = torch.bincount(indices.reshape(-1), minlength=n_experts).to(scores.dtype)
+    freq = counts * (n_experts / (topk * n_tokens))
+    probs = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    return alpha * (freq * probs.mean(dim=0)).sum()
+
+
+def build_model(args):
+    manifold_in, manifold_hidden, manifold_out = Lorentz(1.0), Lorentz(1.0), Lorentz(1.0)
+    if args.model_name == "HELM_MiCE":
+        return HelmMiCE(
+            args, manifold_in, manifold_hidden, manifold_out,
+            attn_impl=args.attn_impl,
+            rope_impl=args.rope_impl,
+            fuse_experts=args.fuse_experts,
+            grad_checkpoint=args.grad_checkpoint,
+        )
+    if args.model_name == "HELM_D":
+        return LTransformerDecoder(manifold_in, manifold_hidden, manifold_out,
+                                   args.arch, args.vocab_size, args.max_seq_len)
+    raise NotImplementedError(f"unknown model_name {args.model_name!r}")
+
 
 def train(args, tokenizer):
     tokenizer.pad_token = tokenizer.eos_token
-    CHECKPOINT_DIR = args.CHECKPOINT_DIR
+    checkpoint_dir = args.CHECKPOINT_DIR
 
     print("Initializing training...")
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters, broadcast_buffers=True)
-    gradient_accumulation_steps = args.gradient_accumulation_steps
-    accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation_steps, kwargs_handlers=[ddp_kwargs])
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=args.find_unused_parameters,
+        # The only buffers are the rotary table and the causal mask, both of
+        # which are deterministic functions of the config and identical on every
+        # rank. Broadcasting them every step is pure wire time.
+        broadcast_buffers=False,
+    )
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps,
+                              kwargs_handlers=[ddp_kwargs])
     set_seed(args.seed, device_specific=True)
 
     print("Loading model and optimizer...")
-
-    manifold_in = Lorentz(1.0)
-    manifold_hidden = Lorentz(1.0)
-    manifold_out = Lorentz(1.0)
-    # Define model
-    if args.model_name == 'HELM_MiCE':
-        decoder = LorentzDeepSeekV3(
-            args,
-            manifold_in,
-            manifold_hidden,
-            manifold_out
-        )
-    elif args.model_name == 'HELM_D':
-        decoder = LTransformerDecoder(
-            manifold_in,
-            manifold_hidden,
-            manifold_out,
-            args.arch,
-            args.vocab_size,
-            args.max_seq_len,
-        )
-    else:
-        raise NotImplementedError
-
-    num_params = sum(p.numel() for p in decoder.parameters())
-    print(f"Total parameters: {num_params:,}")
+    decoder = build_model(args)
+    is_mice = args.model_name == "HELM_MiCE"
+    print(f"Total parameters: {sum(p.numel() for p in decoder.parameters()):,}")
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
-    print('Loading dataset...')
     train_dataloader = prepare_data(tokenizer, args)
-
     print("Dataset loaded and DataLoader prepared.")
 
-    print('Preparing for accelerator...')
+    print("Preparing for accelerator...")
     if not args.project_emb:
-        train_dataloader, decoder, scheduler_euc, scheduler_hyp, optimizer = prepare_accelerator(accelerator, train_dataloader, decoder, args)
+        train_dataloader, decoder, scheduler_euc, scheduler_hyp, optimizer = \
+            prepare_accelerator(accelerator, train_dataloader, decoder, args)
     else:
-        train_dataloader, decoder, scheduler_euc, optimizer = prepare_accelerator(accelerator, train_dataloader, decoder, args)
+        train_dataloader, decoder, scheduler_euc, optimizer = \
+            prepare_accelerator(accelerator, train_dataloader, decoder, args)
+        scheduler_hyp = None
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    if args.compile:
+        # The MoE dispatch is data dependent (variable-sized expert groups), so
+        # dynamo will break the graph there. Everything around it -- attention,
+        # norms, residuals, the dense layers -- still compiles.
+        decoder = torch.compile(decoder)
 
-    global_step = 0
-    start_epoch = 0
-
-    print('Training started...')
-
-    if accelerator.is_main_process:
-        writer = SummaryWriter(log_dir=args.log_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=args.log_dir) if accelerator.is_main_process else None
 
     decoder.train()
-    losses = []
-    avg_loss = 0.0
+    global_step = 0
     total_steps = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     progress_bar = tqdm(range(total_steps), unit="update")
-    if args.model_name == 'HELM_MiCE':
-        local_stash = None
-    for _, batch in enumerate(train_dataloader):
-        seq_ids = batch["sequence_id"]  
-        same_doc = seq_ids.unsqueeze(1) == seq_ids.unsqueeze(2)
-        block_mask = ~same_doc
+
+    # Loss and routing statistics are accumulated *on device* and read back once
+    # per optimizer step. The released loop called `.item()` on every micro-batch
+    # and moved a per-layer histogram to the host with `.cpu()`, so each
+    # micro-batch ended in a full pipeline stall.
+    running_loss = torch.zeros((), device=accelerator.device)
+    expert_usage = None
+
+    for batch in train_dataloader:
+        seq_ids = batch["sequence_id"]
+        block_mask = ~(seq_ids.unsqueeze(1) == seq_ids.unsqueeze(2))
         with accelerator.accumulate(decoder):
-            input_ids = batch["input_ids"]
-            labels = batch["labels"]
-            if args.model_name == 'HELM_MiCE':
-                logits, indices_list, scores_list = decoder(input_ids, attn_mask=block_mask)
+            if is_mice:
+                logits, indices_list, scores_list = decoder(batch["input_ids"],
+                                                            attn_mask=block_mask)
             else:
-                logits = decoder(input_ids, attn_mask=block_mask)
-            loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-            if args.model_name == 'HELM_MiCE':
-                loss_bal = logits.new_tensor(0.0)
-                for idx, scr in zip(indices_list, scores_list):
-                    loss_bal = loss_bal + sequence_balance_loss(
-                                scr, torch.tensor(idx, device='cpu', dtype=torch.float32), args.seq_bal_alpha)
-                if local_stash is None:
-                    local_stash = [
-                        torch.zeros(args.n_routed_experts, dtype=torch.float32, device="cpu")
-                        for _ in range(len(indices_list))
-                    ]
-                for lid, idx in enumerate(indices_list):                       # idx (tokens, topk)
-                    local_stash[lid] += torch.bincount(
-                        idx.flatten().cpu(), minlength=args.n_routed_experts   # 64-element vector
-                    ).float()
-                
-                indices_list = None
-                loss = loss + loss_bal
+                logits = decoder(batch["input_ids"], attn_mask=block_mask)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), batch["labels"].view(-1))
+
+            if is_mice and indices_list:
+                balance = torch.stack([
+                    sequence_balance_loss(scr, idx, args.seq_bal_alpha)
+                    for idx, scr in zip(indices_list, scores_list)]).sum()
+                loss = loss + balance
+                if args.balance_update:
+                    if expert_usage is None:
+                        expert_usage = torch.zeros(len(indices_list), args.n_routed_experts,
+                                                   device=accelerator.device)
+                    for layer_id, idx in enumerate(indices_list):
+                        expert_usage[layer_id] += torch.bincount(
+                            idx.reshape(-1), minlength=args.n_routed_experts).to(expert_usage)
 
             accelerator.backward(loss)
-            avg_loss += loss.item()
-            # if args.model_name == 'HELM_MiCE':
-            #     micro_indices = [accelerator.gather(idx) for idx in indices_list]
-            #     if ("stash" not in locals()) or (stash is None):
-            #         stash = [ [] for _ in range(len(indices_list)) ]
-    
-            #     for layer_id, idx in enumerate(indices_list):
-            #         stash[layer_id].append(idx.cpu()) 
+            running_loss += loss.detach()
 
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(decoder.parameters(), 1.0)
                 optimizer.step()
-                if not args.project_emb:
-                    scheduler_euc.step()
+                scheduler_euc.step()
+                if scheduler_hyp is not None:
                     scheduler_hyp.step()
-                else:
-                    scheduler_euc.step()
-
                 optimizer.zero_grad()
 
-                #Preparing info for logging
-                gathered_loss = accelerator.gather(torch.tensor(avg_loss, device=accelerator.device))
-                mean_loss = gathered_loss.mean().item() / accelerator.gradient_accumulation_steps
-                avg_loss = 0.0
-                losses.append(mean_loss)
+                if is_mice and args.balance_update and expert_usage is not None:
+                    _update_routing_bias(accelerator, decoder, expert_usage)
+                    expert_usage = None
 
-                # if args.model_name == 'HELM_MiCE':
-                #     moe_layer_id = 0
-                #     for layer in decoder.module.layers:
-                #         if not isinstance(layer.ffn, LorentzMoE):
-                #             continue                                  
-                #         stash = local_stash[moe_layer_id].to(layer.ffn.gate.bias.device)
-                #         if dist.is_initialized() and dist.get_world_size() > 1:
-                #             dist.all_reduce(stash, op=dist.ReduceOp.SUM) 
-                #         with torch.no_grad():
-                #             util = stash / stash.sum()  
-                #             mean = util.mean()
-                #             layer.ffn.gate.bias += layer.ffn.gate.bias_update_spd * (mean - util)
-                #         if dist.is_initialized() and dist.get_world_size() > 1:
-                #             dist.broadcast(layer.ffn.gate.bias.data, src=0)
-                #         moe_layer_id += 1
-                #     local_stash = None
-                #     stash = None
+                # The one host sync per optimizer step, instead of one per
+                # micro-batch (256 of them at the released defaults).
+                mean_loss = (accelerator.gather(running_loss).mean().item()
+                             / accelerator.gradient_accumulation_steps)
+                running_loss = torch.zeros((), device=accelerator.device)
 
-                    # moe_layer_id = 0
-                    # for layer in decoder.module.layers:
-                    #     if not isinstance(layer.ffn, LorentzMoE):
-                    #         continue                           
-                    #     # concatenate micro‑batches for this layer
-                    #     step_indices = torch.cat(stash[moe_layer_id], dim=0)
-                    #     layer.ffn.gate.update_bias(step_indices)
-                    #     if dist.is_initialized() and dist.get_world_size() > 1:
-                    #         dist.broadcast(layer.ffn.gate.bias.data, src=0)
-                    #     moe_layer_id += 1
-                    # stash = None
+                if writer is not None:
+                    writer.add_scalar("train/loss", mean_loss, global_step)
+                    writer.add_scalar("train/lr_euc", scheduler_euc.get_last_lr()[0], global_step)
+                    if scheduler_hyp is not None:
+                        writer.add_scalar("train/lr_hyp", scheduler_hyp.get_last_lr()[0],
+                                          global_step)
 
-                if accelerator.is_main_process and writer is not None:
-                        writer.add_scalar("train/loss", mean_loss, global_step)
-                        current_lr_euc = scheduler_euc.get_last_lr()[0]
-                        writer.add_scalar("train/lr_euc", current_lr_euc, global_step)
-                        if not args.project_emb:
-                            current_lr_hyp = scheduler_hyp.get_last_lr()[0]
-                            writer.add_scalar("train/lr_hyp", current_lr_hyp, global_step)
-
-                progress_bar.set_postfix({
-                    "Batch Loss": f"{mean_loss:.4f}"
-                })  
-                global_step+=1
+                progress_bar.set_postfix({"Batch Loss": f"{mean_loss:.4f}"})
+                global_step += 1
                 if global_step % 100 == 0:
-                    if not args.project_emb:
-                        save_checkpoint_both(accelerator, decoder, optimizer, scheduler_euc, scheduler_hyp, CHECKPOINT_DIR, global_step)
-                    else:
-                        save_checkpoint_euc(accelerator, decoder, optimizer, scheduler_euc, CHECKPOINT_DIR, global_step)
+                    _save(accelerator, decoder, optimizer, scheduler_euc, scheduler_hyp,
+                          args, checkpoint_dir, global_step)
                 progress_bar.update(1)
-    if not args.project_emb:
-        save_checkpoint_both(accelerator, decoder, optimizer, scheduler_euc, scheduler_hyp, CHECKPOINT_DIR, global_step)
+
+    _save(accelerator, decoder, optimizer, scheduler_euc, scheduler_hyp, args,
+          checkpoint_dir, global_step)
+
+
+@torch.no_grad()
+def _update_routing_bias(accelerator, decoder, expert_usage):
+    """Auxiliary-loss-free expert balancing (DeepSeek-V3 section 2.1.2).
+
+    Nudges each router's bias towards uniform utilisation, using the statistics
+    gathered over the whole optimizer step.
+
+    The released script implements this and then comments the entire block out,
+    so ``Gate.update_bias`` is dead code and the bias stays at zero for the whole
+    run -- the auxiliary-loss-free half of the balancing strategy never runs.
+    """
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(expert_usage, op=dist.ReduceOp.SUM)
+    model = accelerator.unwrap_model(decoder)
+    layer_id = 0
+    for layer in model.layers:
+        if not isinstance(layer.ffn, LorentzMoE):
+            continue
+        layer.ffn.gate.update_bias(expert_usage[layer_id])
+        layer_id += 1
+
+
+def _save(accelerator, decoder, optimizer, scheduler_euc, scheduler_hyp, args,
+          checkpoint_dir, global_step):
+    if scheduler_hyp is not None:
+        save_checkpoint_both(accelerator, decoder, optimizer, scheduler_euc,
+                             scheduler_hyp, checkpoint_dir, global_step)
     else:
-        save_checkpoint_euc(accelerator, decoder, optimizer, scheduler_euc, CHECKPOINT_DIR, global_step)
+        save_checkpoint_euc(accelerator, decoder, optimizer, scheduler_euc,
+                            checkpoint_dir, global_step)
+
 
 def main() -> None:
     args = parser.parse_args()
-    access_token = '...'
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B", token=access_token)
-    tokenizer.pad_token = tokenizer.eos_token  
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.environ.get("HELM_TOKENIZER", "meta-llama/Llama-3.1-8B"),
+        token=os.environ.get("HF_TOKEN"),
+    )
+    tokenizer.pad_token = tokenizer.eos_token
     train(args, tokenizer)
+
 
 if __name__ == "__main__":
     main()

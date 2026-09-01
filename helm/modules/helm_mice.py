@@ -53,7 +53,7 @@ class Block(nn.Module):
     """One HELM-MiCE layer: HMLA + (dense FFN | MiCE), both with Lorentz residuals."""
 
     def __init__(self, manifold: Lorentz, layer_id: int, args,
-                 attn_impl: str = "flash", rope_impl: str = "real",
+                 attn_impl: str = "flash", rope_impl: str = "complex",
                  fuse_experts: bool = True):
         super().__init__()
         self.manifold = manifold
@@ -94,13 +94,14 @@ class HelmMiCE(nn.Module):
         manifold_in / manifold_hidden / manifold_out: input, hidden and output
             Lorentz manifolds.
         attn_impl: ``"flash"`` (default) or ``"naive"``.
-        rope_impl: ``"real"`` (default) or ``"complex"``.
+        rope_impl: ``"complex"`` (default) or ``"real"``; see
+            :mod:`helm.modules.rope`.
         fuse_experts: fuse the SwiGLU gate/up projections into one GEMM.
         grad_checkpoint: recompute each block's activations in the backward pass.
     """
 
     def __init__(self, args, manifold_in, manifold_hidden, manifold_out,
-                 attn_impl: str = "flash", rope_impl: str = "real",
+                 attn_impl: str = "flash", rope_impl: str = "complex",
                  fuse_experts: bool = True, grad_checkpoint: bool = False):
         super().__init__()
         global rank
@@ -139,6 +140,23 @@ class HelmMiCE(nn.Module):
             "attn_mask",
             torch.ones(args.max_seq_len, args.max_seq_len, dtype=torch.bool).triu(1),
             persistent=False)
+
+    def _apply(self, fn, recurse: bool = True):
+        """Move/cast the module while protecting the rotary table.
+
+        The table is a block of constants, and ``nn.Module.to`` would happily
+        rewrite it: casting to bf16 coarsens the rotation angles, and casting the
+        *complex* layout to any real dtype throws away the imaginary part
+        outright, silently degrading rotary embeddings to a cosine rescale. That
+        is exactly what happens to the upstream model on ``.half()``,
+        ``.bfloat16()`` or ``.to(dtype)`` -- it warns and carries on with a broken
+        table. Restoring the original after the cast keeps device moves working
+        while leaving the values alone.
+        """
+        rope = self.freqs_cis
+        out = super()._apply(fn, recurse)
+        self.freqs_cis = rope.to(device=self.freqs_cis.device)
+        return out
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
         x_time = (x.square().sum(dim=-1, keepdim=True) + self.manifold_in.c).clamp_min(1e-12).sqrt()

@@ -43,6 +43,12 @@ def on_manifold(*shape, dtype=torch.float64, scale=0.3):
     return torch.cat([time, space], dim=-1)
 
 
+def rope_table(args, impl, seqlen=None):
+    """The rotary table in the layout a given ``rope_impl`` expects."""
+    table = precompute_freqs_cis(args) if impl == "complex" else precompute_rope_cache(args)
+    return table if seqlen is None else table[:seqlen]
+
+
 def masks(batch, seqlen):
     causal = torch.triu(torch.ones(seqlen, seqlen, dtype=torch.bool), 1)
     seq = torch.zeros(batch, seqlen, dtype=torch.long)
@@ -66,13 +72,14 @@ def test_rotary_real_matches_complex():
 # ------------------------------------------------------------------ attention
 
 @pytest.mark.parametrize("attn_impl", ["naive", "flash"])
+@pytest.mark.parametrize("rope_impl", ["complex", "real"])
 @pytest.mark.parametrize("use_doc_mask", [False, True])
-def test_hmla_matches_reference(attn_impl, use_doc_mask):
+def test_hmla_matches_reference(attn_impl, rope_impl, use_doc_mask):
     torch.manual_seed(0)
     args = tiny_args(max_seq_len=64, original_seq_len=64)
     manifold = Lorentz(1.0)
     ref = RefMLA(manifold, args).double()
-    fast = LorentzMLA(manifold, args, attn_impl=attn_impl).double()
+    fast = LorentzMLA(manifold, args, attn_impl=attn_impl, rope_impl=rope_impl).double()
 
     assert set(ref.state_dict()) == set(fast.state_dict()), "state dicts must be interchangeable"
     fast.load_state_dict(ref.state_dict())
@@ -83,8 +90,8 @@ def test_hmla_matches_reference(attn_impl, use_doc_mask):
     mask = causal.unsqueeze(0) | doc if use_doc_mask else causal
 
     freqs = precompute_freqs_cis(args)[:seqlen]
-    cache = precompute_rope_cache(args)[:seqlen]
-    torch.testing.assert_close(fast(x, 0, cache, mask), ref(x, 0, freqs, mask),
+    torch.testing.assert_close(fast(x, 0, rope_table(args, rope_impl, seqlen), mask),
+                               ref(x, 0, freqs, mask),
                                rtol=0, atol=ATOL_REF_SOFTMAX)
 
 
@@ -121,8 +128,7 @@ def test_hmla_is_causal_flag_matches_explicit_mask():
     x = on_manifold(batch, seqlen, args.dim - 1)
     causal, _ = masks(batch, seqlen)
     freqs = precompute_freqs_cis(args)[:seqlen]
-    cache = precompute_rope_cache(args)[:seqlen]
-    torch.testing.assert_close(fast(x, 0, cache, mask=None, is_causal=True),
+    torch.testing.assert_close(fast(x, 0, freqs, mask=None, is_causal=True),
                                ref(x, 0, freqs, causal),
                                rtol=0, atol=ATOL_REF_SOFTMAX)
 
@@ -139,7 +145,6 @@ def test_hmla_gradients_match_reference():
     x = on_manifold(batch, seqlen, args.dim - 1)
     causal, _ = masks(batch, seqlen)
     freqs = precompute_freqs_cis(args)[:seqlen]
-    cache = precompute_rope_cache(args)[:seqlen]
 
     def backward(module, table, mask):
         module.zero_grad()
@@ -148,7 +153,7 @@ def test_hmla_gradients_match_reference():
         return inp.grad, {n: p.grad for n, p in module.named_parameters() if p.grad is not None}
 
     gx_ref, gp_ref = backward(ref, freqs, causal)
-    gx_fast, gp_fast = backward(fast, cache, causal)
+    gx_fast, gp_fast = backward(fast, freqs, causal)
     torch.testing.assert_close(gx_fast, gx_ref, rtol=1e-4, atol=1e-4)
     for name, grad in gp_fast.items():
         torch.testing.assert_close(grad, gp_ref[name], rtol=1e-4, atol=1e-4,
@@ -195,15 +200,14 @@ def test_kv_cache_matches_full_forward():
 
     batch, seqlen = 2, 12
     x = on_manifold(batch, seqlen, args.dim - 1)
-    cache_table = precompute_rope_cache(args).double()
+    table = precompute_freqs_cis(args)
 
     with torch.no_grad():
-        full = fast(x, 0, cache_table[:seqlen], mask=None, is_causal=True)
-        kv = [torch.zeros(0)]  # placeholder, replaced below
+        full = fast(x, 0, table[:seqlen], mask=None, is_causal=True)
         from helm.modules.hmla import LorentzKVCache
         kv = LorentzKVCache(batch, seqlen, fast.n_local_heads, fast.qk_head_dim,
                             fast.v_head_dim, dtype=torch.float64, device=x.device)
-        steps = [fast(x[:, i:i + 1], i, cache_table[i:i + 1], mask=None, cache=kv)
+        steps = [fast(x[:, i:i + 1], i, table[i:i + 1], mask=None, cache=kv)
                  for i in range(seqlen)]
     torch.testing.assert_close(torch.cat(steps, dim=1), full, rtol=1e-6, atol=1e-8)
 
@@ -294,6 +298,29 @@ def test_model_grad_checkpointing_matches():
     for name in grads[0]:
         torch.testing.assert_close(grads[1][name], grads[0][name], rtol=1e-9, atol=1e-12,
                                    msg=lambda m, n=name: f"{n}: {m}")
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_dtype_cast_preserves_rotary_table(dtype):
+    """``.to(dtype)`` must not rewrite the rotary table.
+
+    The upstream model stores it as a complex tensor, so casting the module to
+    any real dtype discards ``sin`` and leaves rotary embeddings as a cosine
+    rescale -- a warning on stderr and a quietly broken model.
+    """
+    args = tiny_args()
+    manifolds = (Lorentz(1.0), Lorentz(1.0), Lorentz(1.0))
+
+    ref = RefModel(args, *manifolds)
+    ref.to(dtype)
+    assert ref.freqs_cis.is_complex() is False, "upstream is expected to lose its table"
+
+    for rope_impl in ("real", "complex"):
+        model = HelmMiCE(args, *manifolds, rope_impl=rope_impl)
+        before = model.freqs_cis.clone()
+        model.to(dtype)
+        assert model.freqs_cis.dtype == before.dtype
+        assert torch.equal(model.freqs_cis, before)
 
 
 def test_model_eval_and_generation():
