@@ -7,8 +7,16 @@ applied to HELM-MiCE.
 ```
 upstream/              the CALM reference implementation, vendored (MIT)
 estimate_helm_calm.py  measures what CALM's head would do at HELM's shapes
+experiments/           Stage 0 and Stage 1, runnable
 ASSESSMENT.md          does it help HELM? — the analysis
+RESULTS.md             what Stage 0 and Stage 1 actually found
 ```
+
+**Status:** Stage 0 and Stage 1 are done — see `RESULTS.md`. CALM's autoencoder
+is architecture- and tokenizer-compatible with HELM (75.8M at HELM's vocabulary,
+identical 128256-entry Llama-3 tokenizer), and a hyperbolic backbone **does**
+train under CALM's energy score. It trains less stably than a Euclidean control,
+which is the open risk.
 
 ## What CALM does
 
