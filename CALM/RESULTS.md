@@ -208,7 +208,12 @@ genuine optimum, not "lower is better".
 
 ### Revised Stage 1 conclusion
 
-**There is no geometric pathology.** The energy score trains a hyperbolic
+> **Superseded — see `DID_IT_WORK.md`.** The conclusion below holds for the
+> arithmetic walk used here, and does not generalise. On a structured
+> (tree-language) task the hyperbolic backbone falls 8-13 points behind a
+> width-matched Euclidean one under the same objective.
+
+**There is no geometric pathology** *on this task*. The energy score trains a hyperbolic
 backbone to the same accuracy and the same seed-to-seed stability as a Euclidean
 one, once it is given a learning rate suited to the objective rather than one
 inherited from cross-entropy. The energy score is markedly more lr-sensitive than
