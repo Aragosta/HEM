@@ -125,9 +125,9 @@ embedding, four gated residual blocks, final projection — but builds it from
 stays on the manifold. Only the last projection leaves it, because the
 autoencoder's latent is Euclidean.
 
-**This recovers about 7.5 of the 11.1 point deficit.** The remaining 3.6 points
-are within the seed spread of the Lorentz head itself (93.65 vs 96.98), so
-whether anything real is left is not settled by two seeds.
+**This recovers about 7.5 of the 11.1 point deficit.** Two seeds could not say
+whether the remaining ~3.6 points were real, so five seeds were run — see §5.
+They are real.
 
 Worth noting that the *principled* bridge (`logmap0`) underperforms the naive one
 (`space`). `logmap0` applies a radial warp by hyperbolic distance from the origin;
@@ -144,7 +144,7 @@ not predicted — the reverse was expected.
 | Is the implementation faithful to CALM? | **Yes** — verified against their code, energy score bit-identical |
 | Does it run end to end? | **Yes** — 15 integration tests, gradients reach every component |
 | Does a hyperbolic backbone train under the energy score? | **Yes** |
-| Does it match a Euclidean backbone? | **Close, after fixing the interface** — was 11.1 points behind, now 3.6, which is within seed noise |
+| Does it match a Euclidean backbone? | **No, but much closer** — was 11.1 points behind, now 2.94 at 4.6 standard errors (§5) |
 | Was a layer missing at the HELM/CALM seam? | **Yes** — CALM's Euclidean LayerNorm on a manifold point. A head built from HELM's own hyperbolic layers recovers ~7.5 of the 11.1 points |
 | Is HELM-CALM a good language model? | **Unknown, and untestable at this scale** |
 | Does patching preserve HELM's hierarchy? | **Unknown** — the instrument failed, see `HIERARCHY.md` |
@@ -152,11 +152,67 @@ not predicted — the reverse was expected.
 The finding that matters for `NEXT.md`: what looked like "the hyperbolic backbone
 underperforms under CALM's objective" was mostly **an interface bug, not a
 property of the geometry**. Feeding a manifold point into a Euclidean LayerNorm
-cost ~7.5 points; building the head from HELM's own layers recovers them. The
-remainder is within seed noise.
+cost ~7.5 points; building the head from HELM's own layers recovers them. A
+2.94-point remainder survives, and five seeds show it is not noise (§5).
 
 That is a much better position than the previous section implied, and it
 generalises a warning to the rest of the design: **anywhere CALM's Euclidean
 machinery touches HELM's manifold activations, check the geometry before
 trusting the number.** The patch embedding was already built this way; the head
 was not, and that was worth 7.5 points.
+
+
+## 5. Five seeds: the remainder is real
+
+Two seeds left the residual gap ambiguous. Five settle it. Tree language, K=1,
+4000 steps, identical data and schedule, only the seed varying:
+
+| | s0 | s1 | s2 | s3 | s4 | mean | sd |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| CALM + HELM (Lorentz head) | 93.65% | 96.98% | 96.47% | 96.67% | 96.98% | **96.15%** | 1.41% |
+| CALM + Euclidean (control) | 98.89% | 99.09% | 99.19% | 99.19% | 99.09% | **99.09%** | 0.12% |
+
+**Difference 2.94 points, standard error 0.63, ratio 4.6.** That is not seed
+noise. The earlier "within seed noise" reading came from having only the two
+extreme HELM seeds and no control spread to compare against.
+
+The second number is arguably the more interesting one: the Euclidean control's
+seed spread is **0.12%**; HELM-CALM's is **1.41%**, roughly twelve times larger.
+Whatever is costing the 2.94 points is also making the model markedly less
+stable across initialisations. A systematic 3-point handicap and a 12× variance
+inflation are more consistent with one shared cause than with two.
+
+### Where the geometry still breaks
+
+After the head fix, trace what is on the manifold and what is not:
+
+| component | geometry |
+| --- | --- |
+| token embedding | hyperbolic (`ManifoldParameter` on the hyperboloid) |
+| patch embedding | hyperbolic (`LorentzPatchEmbedding`, space-concat + time recompute) |
+| backbone (HMLA + MiCE) | hyperbolic throughout |
+| energy head | hyperbolic (`LorentzEnergyHead`) — **until its last layer** |
+| **autoencoder latent** | **Euclidean** |
+
+There is exactly one seam left, and it is forced. `LorentzEnergyHead.forward`
+ends with
+
+```python
+return self.final(..., return_space=True)
+```
+
+It drops off the manifold at the final projection not because that is the right
+modelling choice, but because the target it must match — the frozen
+autoencoder's `(mean, log_std)` latent — lives in Euclidean space. The energy
+score `E‖X−y‖^β − ½E‖X−X′‖^β` is then computed with a Euclidean norm on a
+quantity the rest of the model produced hyperbolically.
+
+So the remaining gap sits precisely where the geometry is still mixed. That is a
+hypothesis, not a demonstration — but it is now a hypothesis with a **measured
+2.94-point target** rather than a hypothetical one, which is what a hyperbolic
+latent (GM-VAE-style, where `(μ, log σ²)` under the Fisher metric *is* a point in
+H², or a Lorentz VAE) would have to beat to justify itself.
+
+`gmvae/ASSESSMENT.md` deferred that work for the wrong reason — instability that
+later turned out to be a learning-rate problem. The right reason to pick it up
+now is this table.
