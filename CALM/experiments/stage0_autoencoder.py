@@ -201,7 +201,7 @@ def train_autoencoder(ids, patch, steps=600, batch=64, hidden=256, top_k_vocab=4
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        if step % log_every == 0 or step == 1:
+        if step % log_every == 0 or (step == 1 and log_every < steps):
             print(f"      step {step:4d}  recon-CE {recon.item():.3f}")
 
     model.eval()

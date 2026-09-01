@@ -13,12 +13,18 @@ ASSESSMENT.md          does it help HELM? — the analysis
 RESULTS.md             what Stages 0 and 1 actually found
 ```
 
-**Status:** Stages 0 and 1 pass — see `RESULTS.md`. CALM's autoencoder is
+**Status:** Stages 0, 1 and the 2a/2b/2c pre-checks all pass — see `RESULTS.md`. CALM's autoencoder is
 architecture- and tokenizer-compatible with HELM (75.8M at HELM's vocabulary,
 identical 128256-entry Llama-3 tokenizer), and a hyperbolic backbone trains under
 CALM's energy score **as well and as stably as a Euclidean one** (99.09% vs
 99.23%, seed spread 1.36% vs 1.22%). An initial 27-point seed spread was traced
-to the learning rate, not the geometry. Stage 2 is the next step.
+to the learning rate, not the geometry.
+
+The K>1 patching path now runs end to end (99.18 / 97.80 / 88.28% at K=1/2/4),
+the autoencoder's K=4 reconstruction reaches 97.55% and is still climbing with
+budget, and BrierLM — the only metric on which a discrete and a continuous model
+can be compared — is implemented and validated. **Stage 2 proper is what is left,
+and it needs a GPU.**
 
 ## What CALM does
 

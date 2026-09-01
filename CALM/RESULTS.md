@@ -219,6 +219,107 @@ alarming.
 
 ---
 
+## Stage 2a — the K>1 patching path works
+
+Stage 1 was K=1 by design. Stage 2 turns on three things at once: patched input,
+a sequence shortened by K, and a patch-level latent target. This runs that
+plumbing on the toy task, before any of it costs GPU time.
+
+The HELM-specific piece is the **patch embedding**. CALM concatenates K Euclidean
+token embeddings and projects them. HELM's embeddings are Lorentz vectors, and
+concatenating those lands on no hyperboloid. So here the K *space-like* parts are
+concatenated, the time coordinate is recomputed — giving a valid point in a wider
+Minkowski space — and a `LorentzLinear` maps it back onto the model's manifold.
+Every activation stays on a manifold, which is the property HELM exists to keep.
+
+5000 steps, lr 1e-3, two seeds:
+
+| K | AE recon | positions | seed 0 | seed 1 | mean | energy loss |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 100.00% | 24 | 99.32% | 99.05% | **99.18%** | 16.46 → 4.18 |
+| 2 | 100.00% | 12 | 98.01% | 97.59% | **97.80%** | 19.18 → 4.73 |
+| 4 | 99.74% | 6 | 89.22% | 87.34% | **88.28%** | 20.79 → 5.15 |
+
+**The path works at every K**, far above the 1.03% chance rate, and the seed
+stability from the lr fix holds throughout (spread 0.27 / 0.42 / 1.88 points).
+K=1 reproduces Stage 1's 99.09%, confirming the refactored scaffold is
+consistent with the original.
+
+Accuracy falls with K, which is expected: at K=4 the model predicts four tokens
+ahead with no intermediate context, and that is exactly the trade that buys 4x
+fewer autoregressive steps. **One caveat on the size of that fall**: these
+sequences are 24 tokens, so K=4 leaves only 6 positions of context in which to
+infer the walk's stride. Part of the drop is that truncation rather than
+patching itself, and this task cannot separate the two.
+
+### A bug it caught immediately
+
+`TinyAutoencoder.decode` reshaped with a hardcoded `latent.size(0)`. That is
+correct for a `(tokens, latent)` input and wrong for the
+`(samples, tokens, latent)` block the energy head produces — invisible at K=1,
+where no reshape happens, and a crash the moment patching is switched on. Now
+shape-agnostic in the leading dimensions.
+
+This is precisely the class of failure Stage 2a exists to surface: ten minutes on
+a 33-dimensional CPU model instead of six hours into a GPU run.
+
+## Stage 2b — the K=4 reconstruction shortfall was a budget artifact
+
+Stage 0 reported 86.29% reconstruction at K=4 and attributed it to budget.
+Attributing is not testing, and it mattered: CALM's premise is a near-lossless
+autoencoder, and at 86% the language model predicts into a latent space that
+loses one token in seven.
+
+Sweeping the budget at fixed K=4 on real WikiText:
+
+| steps | accuracy | |
+| --- | --- | --- |
+| 600 | 86.29% | (Stage 0's number) |
+| 1500 | 92.99% | +6.70 |
+| 3000 | 95.67% | +2.67 |
+| 6000 | **97.55%** | +1.88 |
+
+Monotonic, still climbing at the largest budget, with the diminishing-returns
+shape of something approaching an asymptote well above 99%. **Confirmed: a budget
+artifact.** The autoencoder remains a real prerequisite — it has to be trained —
+but there is no evidence of a quality ceiling that would undermine Stage 2.
+
+## Stage 2c — BrierLM implemented and validated
+
+`experiments/brierlm.py` implements the likelihood-free metric from
+`modeling_calm.py::eval_brier`:
+
+```
+brier_k = E[ 1{x1_1..k = y_1..k} + 1{x2_1..k = y_1..k} - 1{x1_1..k = x2_1..k} ]
+BrierLM = (brier_1 · brier_2 · brier_3 · brier_4)^(1/4)
+```
+
+It needs only samples, so it works for a discrete softmax model as well — which
+is what makes it the one metric on which discrete HELM and a CALM-HELM can be
+compared at all (`ASSESSMENT.md` §3.1).
+
+Validated against analytically known cases. A uniform model over V tokens has
+`brier_k = V^-k` and `BrierLM = V^-2.5`:
+
+| | measured | expected |
+| --- | --- | --- |
+| brier_1 | 0.25099 | 0.25000 |
+| brier_2 | 0.06403 | 0.06250 |
+| brier_3 | 0.01548 | 0.01562 |
+| brier_4 | 0.00441 | 0.00391 |
+| BrierLM | 0.03236 | 0.03125 |
+
+A perfect model scores exactly 1.0, and a collapsed one (always the same token)
+scores negative — the collision term doing its job.
+
+**A second bug, in the test itself.** The first version of this check used
+V = 97, where a 4-gram collision has probability 97^-4 ≈ 1e-8. So `brier_4` was
+empirically 0, the product was 0, and `assert got < 10 * expect` passed without
+testing anything. A test that passes vacuously is worse than no test; it is now
+run at V = 4, where every order is measurable and each is checked individually.
+
+---
+
 ## Where this leaves the plan
 
 | stage | status |
@@ -229,8 +330,11 @@ alarming.
 | 1 — hyperbolic backbone trains under energy score | **confirmed** |
 | 1 — parity with a Euclidean backbone | **confirmed** at lr 1e-3: 99.09% vs 99.23%, spread 1.36% vs 1.22% |
 | 1 — instability explained | **yes** — learning rate, not geometry |
-| 2 — K=4 with a Euclidean latent | not started |
-| 3 — hyperbolic latent | not started; §3.3 of the assessment first |
+| 2a — K>1 patching path runs end to end | **confirmed** (99.18 / 97.80 / 88.28% at K=1/2/4) |
+| 2b — autoencoder reaches high reconstruction at K=4 | **confirmed** — 97.55% and climbing; Stage 0's 86% was budget |
+| 2c — BrierLM available for both model types | **done**, validated against closed-form cases |
+| 2 — K=4 on a real corpus, at scale | not started; needs a GPU |
+| 3 — hyperbolic latent | not started; §3.3 of the assessment first, and see `gmvae/` |
 
 Stage 1 passes cleanly, and the caveat it passed with has been resolved: the
 27-point seed spread was a learning rate, not a manifold effect. At lr 1e-3 a
