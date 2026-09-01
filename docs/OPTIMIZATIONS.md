@@ -13,6 +13,55 @@ bug fix, and the tests pin that down.
 
 ---
 
+## 0. Does it compute the same thing?
+
+Yes, and this is worth stating precisely rather than asserting.
+
+**Turn every rewrite off and it is bit-identical.** `attn_impl="naive"`,
+`rope_impl="complex"`, `fuse_experts=False`, `fuse_residual=False` selects the
+literal published formulation of each piece. What remains is only *scheduling* —
+the sorted MoE dispatch, the frozen bias, the mask handling, the non-persistent
+buffers — and the output is then bit-for-bit equal to the reference: logits,
+routing indices and routing scores all compare with `torch.equal`
+(`test_exact_configuration_is_bit_identical`).
+
+**With everything on, the differences are at machine epsilon.** The remaining
+optimizations reassociate floating-point arithmetic — a fused GEMM sums in a
+different order, SDPA reduces differently, the residual reuses one reduction
+instead of taking two. At step 0 the logits are still *bit-identical* and the
+gradients differ by ~1e-17 in float64.
+
+**Over a training run, that round-off is amplified — by exactly as much as
+round-off is.** Adam normalises by `sqrt(v)`, so a relative 1e-16 difference in a
+small-gradient direction becomes an O(1) difference in the update *direction*,
+and 60 steps compound it to ~1e-5 in the weights. That is not evidence of a
+quality difference; it is the ordinary conditioning of stochastic optimization.
+The control makes this concrete — take the reference, move **one weight by a
+single ULP** (a relative change of 1.3e-16), and train both:
+
+| | worst weight drift after 60 Adam steps |
+| --- | --- |
+| reference vs. reference + 1 ULP | 9.5e-06 |
+| reference vs. optimized | 6.6e-06 |
+
+The optimized model ends up **closer to the reference than the reference is to
+itself** under a one-ULP perturbation, and the loss curves track to 5e-07
+throughout (`test_trained_weights_stay_within_round_off`,
+`test_loss_curves_match_over_many_steps`). The same order of drift is what you
+get from changing BLAS thread count, GPU model, or PyTorch version.
+
+**The one deliberate behavioural difference** is the frozen attention bias. It is
+a scalar added to every score before a softmax, so it provably cannot affect any
+output or receive any real gradient; upstream trains it on pure round-off, where
+it wanders slightly off zero without ever changing a prediction. Freezing it also
+removes the one parameter that never receives a gradient, which is what forces
+DDP's `find_unused_parameters`. See `test_attention_bias_has_no_effect`.
+
+For **inference on an existing checkpoint**, there is no ambiguity at all: the
+state dicts are interchangeable and the forward pass agrees to float32 round-off.
+
+---
+
 ## 1. Attention: the hyperbolic scores are ordinary attention in disguise
 
 HMLA scores two points on the Lorentz manifold by the negative of their squared
@@ -56,6 +105,14 @@ kernel, so this is a *lower* bound):
 | 1024 | 97.2 ms | 57.0 ms | **1.71×** | 96.2 → 49.5 MiB |
 | 2048 | 363.9 ms | 233.1 ms | **1.56×** | 384.4 → 195.1 MiB |
 
+Whole model, 126M params, 6 layers, batch 2, same conditions:
+
+| | reference | optimized | speedup |
+| --- | --- | --- | --- |
+| forward, seq 1024 | 1752.7 ms | 1367.1 ms | **1.28×** |
+| forward, seq 2048 | 4058.0 ms | 3015.5 ms | **1.35×** |
+| forward + backward, seq 1024 | 8916.5 ms | 7341.1 ms | **1.21×** |
+
 Verified **bit-exact** against the reference when matched for softmax precision
 and rotary path (`test_hmla_naive_complex_is_bit_exact`), and gradient-matched
 to 1e-4 in float64.
@@ -97,6 +154,29 @@ Each half is initialised separately, because Xavier's bound depends on `fan_out`
 and a single fused draw would give a different distribution than upstream's two.
 State-dict hooks translate to and from the `w1`/`w3` layout, so **checkpoints move
 in both directions**. Agreement with the reference: 4.4e-16 (float64).
+
+## 3b. Fused Lorentz residual
+
+Profiling a training step puts ~53% of the time in `mm`/`bmm`/`addmm` — the
+irreducible compute — and ~28% in hundreds of small `mul`, `pow`, `sum`, `div`,
+`cat` and `copy_` calls. That is the cost of the hyperbolic glue: carrying a
+point's time coordinate around, discarding it, and deriving it again.
+
+`LResNet` is the worst offender, and it makes seven passes over the activation
+where four suffice:
+
+* it computes `sqrt(c) * ave / denom` over **all** `dim` components and then
+  throws the time component away, keeping only `[..., 1:]` to rescale;
+* it multiplies, divides, then multiplies again, where `scale`, `sqrt(c)` and
+  `1/denom` fold into one per-row coefficient;
+* it reduces over the feature axis **twice** — once for the Minkowski inner
+  product, once for the new time coordinate. The second is redundant: the
+  rescaled space part is a scalar multiple of `ave_s`, so
+  `|out_s|² = coef² · |ave_s|²` reuses the first reduction.
+
+`helm/modules/lorentz_ops.py::LorentzResidual` is a drop-in replacement with an
+identical state dict. **Measured: 7.48 ms → 5.39 ms (1.39×)** at the 120M shape,
+seq 2048; agreement with `LResNet` is 7e-15 in float64, gradients included.
 
 ## 4. Rotary embeddings: an honest non-result
 
@@ -172,8 +252,10 @@ resolve lazily (`helm/_lazy.py`); the attribute surface is unchanged.
   branching). Making it static would require a capacity limit and therefore token
   dropping, which changes training dynamics — not a decision to make silently on
   someone else's model. Attention and the dense layers compile fine.
-* **Whole-model speedup on CPU is ~1.05×**, because CPU has no flash kernel and
-  no asynchronous queue for the sync elimination to matter to. The attention and
-  memory wins above are real and measured; the sync-elimination and
-  launch-overhead wins are **not measured here** — this machine has no GPU. Run
-  `benchmarks/bench_helm_mice.py` on one before quoting a number.
+* **The MoE dispatch's device-sync elimination is unmeasured.** CPU has no
+  asynchronous queue for it to matter to. It is a GPU optimization, and this
+  machine has no GPU — run `benchmarks/bench_helm_mice.py` on one before quoting
+  a number for it.
+* **`is_causal=True` buys nothing on CPU.** Skipping the masked half of the
+  attention matrix is a FlashAttention property; the CPU fallback still walks it.
+  So the whole-model numbers below are, again, lower bounds.

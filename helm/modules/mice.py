@@ -48,6 +48,8 @@ from helm.hypercore.models.lorentz_feedforward import LorentzFeedForward
 from helm.hypercore.nn.conv.conv_util_layers import LResNet
 from helm.hypercore.nn.linear.lorentz_linear import LorentzLinear
 
+from .lorentz_ops import LorentzResidual
+
 world_size = dist.get_world_size() if dist.is_initialized() else 1
 rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -247,9 +249,11 @@ class LorentzMoE(nn.Module):
         fuse_experts: use :class:`LorentzSwiGLU` (fused gate/up GEMM) for the
             experts and the shared expert. ``False`` falls back to upstream's
             three-``LorentzLinear`` layout.
+        fuse_residual: use the fused Lorentz residual instead of ``LResNet``.
     """
 
-    def __init__(self, manifold: Lorentz, args, fuse_experts: bool = True):
+    def __init__(self, manifold: Lorentz, args, fuse_experts: bool = True,
+                 fuse_residual: bool = True):
         super().__init__()
         self.dim = args.dim
         self.manifold = manifold
@@ -287,11 +291,13 @@ class LorentzMoE(nn.Module):
             self.shared_experts = LorentzFeedForward(
                 self.manifold, args.dim, args.n_shared_experts * args.moe_inter_dim)
 
+        residual = LorentzResidual if fuse_residual else LResNet
         if self.n_activated_experts == 2:
-            self.add_experts = LResNet(self.manifold, use_scale=True, scale=2.0, learn_scale=True)
+            self.add_experts = residual(self.manifold, use_scale=True, scale=2.0,
+                                        learn_scale=True)
         if self.n_shared_experts == 1:
-            self.weighted_sum = LResNet(self.manifold, weight=1.0, use_scale=True,
-                                        scale=2.0, learn_scale=False)
+            self.weighted_sum = residual(self.manifold, weight=1.0, use_scale=True,
+                                         scale=2.0, learn_scale=False)
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
         x_time = (x.square().sum(dim=-1, keepdim=True) + self.manifold.c).clamp_min(1e-12).sqrt()

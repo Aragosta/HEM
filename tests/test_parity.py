@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from helm.hypercore.manifolds import Lorentz  # noqa: E402
 from helm.modules.helm_mice import HelmMiCE  # noqa: E402
 from helm.modules.hmla import LorentzMLA  # noqa: E402
+from helm.modules.lorentz_ops import LorentzResidual  # noqa: E402
 from helm.modules.mice import LorentzMoE  # noqa: E402
 from helm.modules.rope import (apply_rotary_emb, apply_rotary_emb_real,  # noqa: E402
                                precompute_freqs_cis, precompute_rope_cache)
@@ -212,6 +213,56 @@ def test_kv_cache_matches_full_forward():
     torch.testing.assert_close(torch.cat(steps, dim=1), full, rtol=1e-6, atol=1e-8)
 
 
+# ------------------------------------------------------------------- residual
+
+@pytest.mark.parametrize("config", [
+    pytest.param(dict(use_scale=True, scale=19.75, learn_scale=False), id="block"),
+    pytest.param(dict(use_scale=True, scale=2.0, learn_scale=True), id="moe-add"),
+    pytest.param(dict(weight=1.0, use_scale=True, scale=2.0, learn_scale=False),
+                 id="moe-weighted"),
+    pytest.param(dict(), id="no-scale"),
+])
+@pytest.mark.parametrize("per_row_weight", [False, True])
+def test_fused_residual_matches_lresnet(config, per_row_weight):
+    """The fused residual must equal HyperCore's LResNet in every configuration."""
+    from helm.hypercore.nn.conv.conv_util_layers import LResNet
+
+    torch.manual_seed(0)
+    manifold = Lorentz(1.0)
+    ref = LResNet(manifold, **config).double()
+    fast = LorentzResidual(manifold, **config).double()
+    assert set(ref.state_dict()) == set(fast.state_dict())
+    fast.load_state_dict(ref.state_dict())
+
+    x = on_manifold(2, 24, 32)
+    y = on_manifold(2, 24, 32)
+    weight = torch.rand(2, 24, 1, dtype=torch.float64) if per_row_weight else None
+    torch.testing.assert_close(fast(x, y, weight), ref(x, y, weight),
+                               rtol=1e-12, atol=1e-13)
+
+
+def test_fused_residual_gradients_match():
+    from helm.hypercore.nn.conv.conv_util_layers import LResNet
+
+    torch.manual_seed(0)
+    manifold = Lorentz(1.0)
+    ref = LResNet(manifold, use_scale=True, scale=19.75, learn_scale=False).double()
+    fast = LorentzResidual(manifold, use_scale=True, scale=19.75, learn_scale=False).double()
+    fast.load_state_dict(ref.state_dict())
+
+    x0 = on_manifold(2, 24, 32)
+    y0 = on_manifold(2, 24, 32)
+    grads = []
+    for module in (ref, fast):
+        x = x0.clone().requires_grad_(True)
+        y = y0.clone().requires_grad_(True)
+        module.zero_grad()
+        module(x, y).square().sum().backward()
+        grads.append((x.grad, y.grad, module.w_y.grad))
+    for a, b in zip(grads[0], grads[1]):
+        torch.testing.assert_close(b, a, rtol=1e-10, atol=1e-12)
+
+
 # ------------------------------------------------------------------------ MoE
 
 @pytest.mark.parametrize("fuse_experts", [False, True])
@@ -339,3 +390,30 @@ def test_model_eval_and_generation():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_exact_configuration_is_bit_identical():
+    """Every optimization can be turned off individually, back to bit-exactness.
+
+    ``attn_impl="naive"``, ``rope_impl="complex"``, ``fuse_experts=False`` and
+    ``fuse_residual=False`` select the literal published formulation of each
+    piece. The scheduling changes that remain -- the sorted MoE dispatch, the
+    frozen bias, the mask handling, the non-persistent buffers -- must then
+    produce output that is bit-for-bit identical to the reference.
+    """
+    torch.manual_seed(0)
+    args = tiny_args()
+    manifolds = (Lorentz(1.0), Lorentz(1.0), Lorentz(1.0))
+    ref = RefModel(args, *manifolds).double()
+    fast = HelmMiCE(args, *manifolds, attn_impl="naive", rope_impl="complex",
+                    fuse_experts=False, fuse_residual=False).double()
+    fast.load_state_dict(ref.state_dict(), strict=False)
+
+    tokens = torch.randint(0, args.vocab_size, (2, 24))
+    ref.train()
+    fast.train()
+    ref_logits, ref_idx, ref_scores = ref(tokens)
+    fast_logits, fast_idx, fast_scores = fast(tokens)
+    assert torch.equal(ref_logits, fast_logits)
+    assert all(torch.equal(a, b) for a, b in zip(ref_idx, fast_idx))
+    assert all(torch.equal(a, b) for a, b in zip(ref_scores, fast_scores))

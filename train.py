@@ -71,6 +71,7 @@ def build_model(args):
             attn_impl=args.attn_impl,
             rope_impl=args.rope_impl,
             fuse_experts=args.fuse_experts,
+            fuse_residual=args.fuse_residual,
             grad_checkpoint=args.grad_checkpoint,
         )
     if args.model_name == "HELM_D":

@@ -13,6 +13,8 @@ This is the optimized assembly of :mod:`helm.modules.hmla` and
 * **Eval mode works.** Upstream's ``Block.forward`` and ``LorentzMoE.forward``
   disagree about their arity outside training, so the released model raises as
   soon as ``.eval()`` is called (see :class:`helm.modules.mice.Gate`).
+* **A fused Lorentz residual** (:class:`helm.modules.lorentz_ops.LorentzResidual`),
+  which is where a surprising amount of the non-GEMM time goes.
 * **Optional activation checkpointing** (``--grad_checkpoint``), which trades
   ~30% recompute for a large activation saving and usually buys back more than
   it costs by allowing a bigger micro-batch.
@@ -40,6 +42,7 @@ from helm.hypercore.nn.conv.conv_util_layers import LResNet, LorentzRMSNorm
 from helm.hypercore.nn.linear.lorentz_linear import LorentzLinear
 
 from .hmla import LorentzKVCache, LorentzMLA
+from .lorentz_ops import LorentzResidual
 from .mice import LorentzMoE, LorentzSwiGLU
 from .rope import precompute_freqs_cis, precompute_rope_cache
 
@@ -54,7 +57,7 @@ class Block(nn.Module):
 
     def __init__(self, manifold: Lorentz, layer_id: int, args,
                  attn_impl: str = "flash", rope_impl: str = "complex",
-                 fuse_experts: bool = True):
+                 fuse_experts: bool = True, fuse_residual: bool = True):
         super().__init__()
         self.manifold = manifold
         self.attn = LorentzMLA(manifold, args, attn_impl=attn_impl, rope_impl=rope_impl)
@@ -62,14 +65,16 @@ class Block(nn.Module):
             self.ffn = (LorentzSwiGLU(manifold, args.dim, args.inter_dim) if fuse_experts
                         else LorentzFeedForward(manifold, args.dim, args.inter_dim))
         else:
-            self.ffn = LorentzMoE(manifold, args, fuse_experts=fuse_experts)
+            self.ffn = LorentzMoE(manifold, args, fuse_experts=fuse_experts,
+                                  fuse_residual=fuse_residual)
         self.is_moe = isinstance(self.ffn, LorentzMoE)
         self.attn_norm = LorentzRMSNorm(manifold, args.dim - 1)
         self.ffn_norm = LorentzRMSNorm(manifold, args.dim - 1)
-        self.attn_res = LResNet(manifold, use_scale=True, scale=math.sqrt(args.dim),
-                                learn_scale=False)
-        self.ffn_res = LResNet(manifold, use_scale=True, scale=math.sqrt(args.dim),
-                               learn_scale=False)
+        residual = LorentzResidual if fuse_residual else LResNet
+        self.attn_res = residual(manifold, use_scale=True,
+                                 scale=math.sqrt(args.dim), learn_scale=False)
+        self.ffn_res = residual(manifold, use_scale=True,
+                                scale=math.sqrt(args.dim), learn_scale=False)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor,
                 mask: Optional[torch.Tensor], is_causal: bool = False,
@@ -97,12 +102,16 @@ class HelmMiCE(nn.Module):
         rope_impl: ``"complex"`` (default) or ``"real"``; see
             :mod:`helm.modules.rope`.
         fuse_experts: fuse the SwiGLU gate/up projections into one GEMM.
+        fuse_residual: use the fused Lorentz residual. Setting both ``fuse_*``
+            to ``False`` with ``attn_impl="naive"`` and ``rope_impl="complex"``
+            gives a configuration that is *bit-identical* to the reference.
         grad_checkpoint: recompute each block's activations in the backward pass.
     """
 
     def __init__(self, args, manifold_in, manifold_hidden, manifold_out,
                  attn_impl: str = "flash", rope_impl: str = "complex",
-                 fuse_experts: bool = True, grad_checkpoint: bool = False):
+                 fuse_experts: bool = True, fuse_residual: bool = True,
+                 grad_checkpoint: bool = False):
         super().__init__()
         global rank
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -124,7 +133,7 @@ class HelmMiCE(nn.Module):
 
         self.layers = nn.ModuleList([
             Block(manifold_hidden, i, args, attn_impl=attn_impl, rope_impl=rope_impl,
-                  fuse_experts=fuse_experts)
+                  fuse_experts=fuse_experts, fuse_residual=fuse_residual)
             for i in range(args.n_layers)])
         self.final_proj = LorentzLinear(manifold_hidden, args.dim, args.dim - 1,
                                         manifold_out=manifold_out)

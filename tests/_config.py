@@ -78,3 +78,26 @@ def bench_args(**overrides):
     )
     defaults.update(overrides)
     return tiny_args(**defaults)
+
+
+def cast_module(module, dtype):
+    """``module.to(dtype)``, but leave complex buffers alone.
+
+    The reference model stores its rotary table as a complex buffer, and a plain
+    ``.to(dtype)`` casts it to a real dtype and silently discards ``sin`` -- so
+    comparing against a reference cast that way would be comparing against a
+    broken model. (This is exactly the trap documented in
+    ``docs/OPTIMIZATIONS.md``; ``HelmMiCE`` protects itself from it, the
+    reference does not.)
+    """
+    import torch
+
+    for param in module.parameters():
+        if param.is_floating_point():
+            param.data = param.data.to(dtype)
+    for name, buf in module.named_buffers():
+        if buf.is_floating_point():
+            parent, _, leaf = name.rpartition(".")
+            setattr(module.get_submodule(parent) if parent else module, leaf,
+                    buf.to(dtype))
+    return module

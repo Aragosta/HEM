@@ -90,32 +90,62 @@ accelerate launch --mixed_precision bf16 train.py \
 
 ## Results
 
-Attention, measured on CPU at the 120M shape (fp32, batch 2, single layer). CPU
-has no FlashAttention kernel, so these are *lower* bounds:
+Measured on CPU at the 120M shape (fp32, batch 2). CPU has no FlashAttention
+kernel, so these are *lower* bounds:
 
-| seq len | reference | optimized | speedup | peak allocation |
-| --- | --- | --- | --- | --- |
-| 1024 | 97.2 ms | 57.0 ms | **1.71×** | 96.2 → 49.5 MiB |
-| 2048 | 363.9 ms | 233.1 ms | **1.56×** | 384.4 → 195.1 MiB |
+| | reference | optimized | speedup |
+| --- | --- | --- | --- |
+| attention, seq 1024 | 97.2 ms | 57.0 ms | **1.71×** |
+| attention, seq 2048 | 363.9 ms | 233.1 ms | **1.56×** |
+| whole model forward, seq 1024 | 1752.7 ms | 1367.1 ms | **1.28×** |
+| whole model forward, seq 2048 | 4058.0 ms | 3015.5 ms | **1.35×** |
+| whole model fwd+bwd, seq 1024 | 8916.5 ms | 7341.1 ms | **1.21×** |
 
-Whole-model speedup on CPU is only ~1.05×: the sync-elimination and
-launch-overhead work has nothing to bite on without an asynchronous device. Those
-wins are **unmeasured here** — this was developed on a CPU-only machine. Run the
-benchmark on a GPU before quoting a number:
+Attention peak allocation roughly halves (384 → 195 MiB at seq 2048), because
+the `(B, H, N, N)` score matrix is never built.
+
+Two wins here are **unmeasured**, because this was developed on a CPU-only
+machine: eliminating the MoE's per-expert device syncs needs an asynchronous
+device to matter, and `is_causal=True` only skips the masked half of the
+attention matrix under a real FlashAttention kernel. Run the benchmark on a GPU
+before quoting a number:
 
 ```bash
 python benchmarks/bench_helm_mice.py --preset 120m --seq-len 2048 --dtype bfloat16
 ```
 
-## Verify
+## Is the output the same?
+
+Yes — and the tests are built to demonstrate it rather than assert it.
 
 ```bash
-python -m pytest tests/ -q       # 32 tests
+python -m pytest tests/ -q       # 48 tests
 ```
 
-The attention rewrite is **bit-exact** against the published implementation when
-matched for softmax precision and rotary path; the MoE is bit-exact and makes
-identical routing decisions.
+* **Turn every rewrite off and it is bit-identical.** `attn_impl="naive"`,
+  `rope_impl="complex"`, `fuse_experts=False`, `fuse_residual=False` gives the
+  literal published formulation; what remains is pure scheduling, and logits,
+  routing indices and routing scores all match under `torch.equal`.
+* **With everything on, step-0 logits are still bit-identical** and gradients
+  differ by ~1e-17 in float64 — the fused GEMM and SDPA just sum in a different
+  order.
+* **Over a training run that round-off gets amplified, by exactly as much as
+  round-off is.** Take the reference, move **one weight by a single ULP**, and
+  train both for 60 Adam steps:
+
+  | | worst weight drift |
+  | --- | --- |
+  | reference vs. reference + 1 ULP | 9.5e-06 |
+  | reference vs. optimized | 6.6e-06 |
+
+  The optimized model ends up closer to the reference than the reference is to
+  itself under a one-ULP perturbation, and the loss curves track to 5e-07. This
+  is the same order of drift you get from changing BLAS threads or GPU model.
+
+The one deliberate difference is the attention bias, a scalar added to every
+score before a softmax — it provably cannot change any output, so it is frozen
+here while upstream trains it on round-off. Details in
+[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md).
 
 ## What was wrong with the original
 
