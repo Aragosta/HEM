@@ -273,9 +273,14 @@ and the values are left alone. Regression test:
   per-layer histogram moved to the host with `.cpu()`.
 * `broadcast_buffers=False`: the only buffers are the rotary table and the causal
   mask, both deterministic functions of the config and identical on every rank.
-* `find_unused_parameters` now defaults to `False`. DDP's unused-parameter search
-  walks the autograd graph on every backward pass. Freezing the provably-dead
-  attention bias removes the one parameter that never received a gradient.
+* `find_unused_parameters` stays `True`, and an earlier revision of this document
+  was wrong to say otherwise. DDP's unused-parameter search really is a
+  throughput cost, but HELM has parameters that legitimately receive no gradient
+  on a given step: MoE routing leaves experts unselected (measured: 6 of 8
+  starved even at 1024 tokens, an untrained router concentrating on a few), and
+  `LorentzEmbeddings.add_pos` is dead weight whenever `posit_embed=False`, which
+  is HELM's own setting. Freezing the attention bias removed *one* such
+  parameter, not all of them. Caught by `CALM/experiments/test_helm_calm.py`.
 * Optional activation checkpointing (`--grad_checkpoint`) and `torch.compile`
   (`--compile`).
 

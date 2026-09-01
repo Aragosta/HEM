@@ -17,10 +17,19 @@ config_args = {
         'log_dir': ('../log', 'where to log training dynamics'),
         'data_path': ('../data', 'path to data'),
         'model_name': ('HELM_MiCE', 'One of HELM_D or HELM_MiCE'),
-        # DDP's unused-parameter search walks the autograd graph on every backward
-        # pass; it is a real throughput cost and is not needed here, because every
-        # expert receives a gradient through the shared routing weights.
-        'find_unused_parameters': (False, 'whether the accelerator should find unused parameters'),
+        # Must stay True. DDP's unused-parameter search is a real throughput
+        # cost, but HELM genuinely has parameters that receive no gradient on a
+        # given step, and DDP errors out without it:
+        #   * MoE routing leaves some experts unselected in any given
+        #     micro-batch -- measured: 6 of 8 experts starved even at 1024
+        #     tokens, because an untrained router concentrates on a few;
+        #   * LorentzEmbeddings.add_pos is an LResNet used only when
+        #     posit_embed=True, so with HELM's posit_embed=False it is dead
+        #     weight that never receives a gradient at any batch size.
+        # An earlier version of this port defaulted it to False on the mistaken
+        # belief that freezing the attention bias removed the only such
+        # parameter. See CALM/experiments/test_helm_calm.py, which caught it.
+        'find_unused_parameters': (True, 'whether the accelerator should find unused parameters'),
         'max_batch_size': (1, 'Maximum batch size'),
         'max_seq_len': (2048, 'Maximum sequence length'),
         'project_emb': (False, 'If true, the model will map tokens to space-like dimension of Lorentz vectors'),
