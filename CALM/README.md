@@ -10,7 +10,9 @@ gmvae/                 GM-VAE, evaluated as a hyperbolic latent (Stage 3)
 estimate_helm_calm.py  measures what CALM's head would do at HELM's shapes
 experiments/           Stage 0 and Stage 1, plus the stability diagnosis
 ASSESSMENT.md          does it help HELM? — the analysis
-RESULTS.md             what Stages 0 and 1 actually found
+RESULTS.md             what Stages 0, 1 and the 2a/2b/2c pre-checks found
+NEXT.md                what a proper HELM-CALM needs, and what could kill it
+PARKED.md              the end-to-end efficiency benchmark, specified but unrun
 ```
 
 **Status:** Stages 0, 1 and the 2a/2b/2c pre-checks all pass — see `RESULTS.md`. CALM's autoencoder is
@@ -24,7 +26,9 @@ The K>1 patching path now runs end to end (99.18 / 97.80 / 88.28% at K=1/2/4),
 the autoencoder's K=4 reconstruction reaches 97.55% and is still climbing with
 budget, and BrierLM — the only metric on which a discrete and a continuous model
 can be compared — is implemented and validated. **Stage 2 proper is what is left,
-and it needs a GPU.**
+and it needs a GPU** — see `NEXT.md`, which also works out that it should be run
+at the 1B preset rather than 120M: at 120M the frozen autoencoder is 53% of the
+deployed system and the total is *larger* than plain HELM.
 
 ## What CALM does
 
