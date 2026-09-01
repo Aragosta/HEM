@@ -11,7 +11,9 @@ estimate_helm_calm.py  measures what CALM's head would do at HELM's shapes
 experiments/           Stage 0 and Stage 1, plus the stability diagnosis
 ASSESSMENT.md          does it help HELM? — the analysis
 RESULTS.md             what Stages 0, 1 and the 2a/2b/2c pre-checks found
+helm_calm.py           the assembled HELM-CALM: optimized HELM + CALM's head
 NEXT.md                what a proper HELM-CALM needs, and what could kill it
+HIERARCHY.md           the hierarchy test: attempted, and why it did not work
 PARKED.md              the end-to-end efficiency benchmark, specified but unrun
 ```
 

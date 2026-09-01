@@ -156,9 +156,12 @@ anything measured so far.
    geometry matches the *token-level* hierarchy of language. CALM compresses four
    tokens into one vector. If the hierarchy lives below the patch boundary, HELM's
    advantage over a Euclidean baseline could evaporate — leaving a model with
-   CALM's efficiency and no reason to be hyperbolic. This is the central research
-   risk, it is not addressed by any experiment run so far, and the toy task cannot
-   speak to it.
+   CALM's efficiency and no reason to be hyperbolic. **Attempted and unresolved**
+   — see `HIERARCHY.md`. A synthetic tree-structured language was built to test
+   it; the instrument turned out not to detect hierarchy at all, because discrete
+   HELM itself shows almost none on that task (recovery +0.06 at 98.79% accuracy)
+   while its representations become *less* tree-like over training. The risk
+   stands, and `HIERARCHY.md` sets out what a working test would need.
 2. **The energy score's variance grows with latent dimension.** All of Stage 1
    and 2a used a 32-dimensional latent. CALM uses 128. The estimator averages
    `num_samples=8` draws; whether 8 remains adequate at 128 dimensions and at a
