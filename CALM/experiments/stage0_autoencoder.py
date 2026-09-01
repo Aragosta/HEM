@@ -148,11 +148,15 @@ class TinyAutoencoder(nn.Module):
         return self.to_latent(self.enc_norm(h)).chunk(2, dim=-1)
 
     def decode(self, latent):
-        """(B, latent) -> (B, K, vocab) logits."""
+        """(..., latent) -> (..., K, vocab) logits.
+
+        Shape-agnostic in the leading dimensions: the energy head hands this a
+        (samples, tokens, latent) block, not just (tokens, latent).
+        """
         h = self.from_latent(latent)
         for block in self.dec_a:
             h = block(h)
-        h = self.expand(h).view(latent.size(0), self.patch, -1)
+        h = self.expand(h).view(*latent.shape[:-1], self.patch, -1)
         for block in self.dec_b:
             h = block(h)
         return self.head(self.dec_norm(h))
