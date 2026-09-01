@@ -1,0 +1,78 @@
+"""Hyperbolic neural-network layers.
+
+Names are resolved lazily (see :mod:`helm._lazy`) from the ``conv``, ``linear``,
+``attention``, ``graph_conv`` and ``peft`` subpackages. This keeps
+``hypercore.nn.LorentzLinear`` working exactly as before while no longer forcing
+``torch_geometric``/``torch_scatter`` to be importable for a language-model run.
+The subpackages themselves are unchanged and still import eagerly.
+"""
+
+from helm._lazy import install_lazy
+
+_EXPORTS = {
+    "CentroidDistance": ".graph_conv",
+    "DenseAtt": ".graph_conv",
+    "EFusion": ".graph_conv",
+    "GATConv": ".graph_conv",
+    "GCNConv": ".graph_conv",
+    "GILConv": ".graph_conv",
+    "GraphAttentionLayer": ".graph_conv",
+    "GraphConvolution": ".graph_conv",
+    "HFusion": ".graph_conv",
+    "HGATConv": ".graph_conv",
+    "HGCNConv": ".graph_conv",
+    "HGNNConv": ".graph_conv",
+    "HNNLayer": ".linear",
+    "HyboNetLinear": ".linear",
+    "HybonetConv": ".graph_conv",
+    "HypAct": ".linear",
+    "HypAgg": ".graph_conv",
+    "HypLinear": ".linear",
+    "HypResidual": ".linear",
+    "LGCNAgg": ".graph_conv",
+    "LGCNConv": ".graph_conv",
+    "LGCNLinear": ".graph_conv",
+    "LResNet": ".conv",
+    "Linear": ".linear",
+    "LoraConfig": ".peft",
+    "LoraModel": ".peft",
+    "LorentzActivation": ".conv",
+    "LorentzAgg": ".graph_conv",
+    "LorentzBatchNorm": ".conv",
+    "LorentzBatchNorm1d": ".conv",
+    "LorentzBatchNorm2d": ".conv",
+    "LorentzBottleneck": ".conv",
+    "LorentzCLS": ".linear",
+    "LorentzConv1d": ".conv",
+    "LorentzConv2d": ".conv",
+    "LorentzConvTranspose2d": ".conv",
+    "LorentzDropout": ".conv",
+    "LorentzEmbeddings": ".attention",
+    "LorentzGlobalAvgPool2d": ".conv",
+    "LorentzInputBlock": ".conv",
+    "LorentzLayerNorm": ".conv",
+    "LorentzLinear": ".linear",
+    "LorentzMLR": ".conv",
+    "LorentzMultiheadAttention": ".attention",
+    "LorentzNormalization": ".conv",
+    "LorentzPatchEmbedding": ".attention",
+    "LorentzRMSNorm": ".conv",
+    "LorentzRelativePosEncoding": ".attention",
+    "LorentzResidualBlock": ".conv",
+    "LorentzSparseSqDisAtt": ".attention",
+    "PeftConfig": ".peft",
+    "PoincareBatchNorm": ".conv",
+    "PoincareBatchNorm2d": ".conv",
+    "PoincareConvolution2d": ".conv",
+    "PoincareLinear": ".linear",
+    "PoincareMLR": ".conv",
+    "PseudoHypAgg": ".graph_conv",
+    "PseudoHypLinear": ".linear",
+    "QGCNConv": ".graph_conv",
+    "SpGraphAttentionLayer": ".graph_conv",
+    "SpecialSpmm": ".graph_conv",
+    "SpecialSpmmFunction": ".graph_conv",
+}
+
+install_lazy(__name__, globals(), _EXPORTS,
+             submodules=("conv", "linear", "attention", "graph_conv", "peft"))
