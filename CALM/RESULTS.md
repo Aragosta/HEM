@@ -140,6 +140,85 @@ seed happened to favour.
 
 ---
 
+## Review of the energy implementation, and why the seeds scattered
+
+Asked for before Stage 2, and it changed the conclusion.
+
+### The implementation is correct
+
+`CALM/experiments/verify_energy.py` compares our `energy_score` against CALM's
+`modeling_energy.py::energy_score` with the target noise injected so both draw
+identical samples:
+
+| beta | value max diff | gradient max diff |
+| --- | --- | --- |
+| 0.5 | 0.000e+00 | **NaN** |
+| 1.0 | **0.000e+00** | **0.000e+00** |
+| 1.5 | 0.000e+00 | 0.000e+00 |
+
+Bit-identical, values and gradients. The formula was never the problem.
+
+The NaN at `beta=0.5` is present in **CALM's implementation too**, and is worth
+knowing about: the pairwise term includes the self-distances `‖x_i − x_i‖ = 0`,
+and `d/dx ‖x‖^β` is unbounded at 0 for `β < 1`. At `β = 1` PyTorch's subgradient
+for the norm at 0 is 0 and it is safe. CALM's default is 1.0, so nothing is
+broken in practice — but `β < 1` would silently produce NaN gradients.
+
+A separate sanity check confirms the rule behaves properly: the score falls
+monotonically as the predictive distribution is shifted away from the target
+(offset 0.0 → 4.81, 0.5 → 6.38, 1.0 → 10.08, 2.0 → 19.85 in loss).
+
+### Three candidate causes, tested
+
+**A. Evaluation noise — rejected.** Majority voting over 8 samples might just be
+a noisy estimator of the mode. It is not: accuracy is flat in the pool size.
+
+| seed | acc@8 | acc@32 | acc@128 |
+| --- | --- | --- | --- |
+| 0 | 53.12% | 56.52% | 57.34% |
+| 1 | 18.07% | 17.12% | 20.65% |
+
+The spread is in the model, not the metric.
+
+**B. Manifold drift — real, but not the cause.** HELM's token embedding is a
+`ManifoldParameter` living on the hyperboloid; Stage 1 optimized it with plain
+AdamW, which walks it off. The violation `|⟨x,x⟩_L + c|` reached **3.92** — the
+embedding was nowhere near the manifold it is supposed to inhabit. Adding a
+retraction each step drives it to 3.6e-07, and barely moves accuracy
+(53.12% → 55.43%, 18.07% → 17.12%). So it was a genuine defect in the experiment
+harness, worth fixing, and not the explanation.
+
+(This affected the *harness* only. HELM's own `train.py` uses a Riemannian
+optimizer for `ManifoldParameter`s, as upstream intended; the discrete baseline
+here was handicapped in exactly the same way, so the Stage 1 comparison stayed
+internally fair.)
+
+**C. Learning rate — the cause.** 5000 steps, retraction on, three seeds:
+
+| lr | seed 0 | seed 1 | seed 2 | mean | spread |
+| --- | --- | --- | --- | --- | --- |
+| 3e-4 | 20.92% | 14.81% | 18.07% | 17.93% | 6.11% |
+| **1e-3** | **99.46%** | **98.23%** | **99.59%** | **99.09%** | **1.36%** |
+| 3e-3 | 88.86% | 74.18% | 98.64% | 87.23% | 24.46% |
+
+At **1e-3 the spread collapses from 24.5 points to 1.4**, and the mean reaches
+**99.09%** — statistically indistinguishable from the Euclidean control's 99.23%
+(spread 1.22%). 3e-4 is simply undertrained at this step budget, so this is a
+genuine optimum, not "lower is better".
+
+### Revised Stage 1 conclusion
+
+**There is no geometric pathology.** The energy score trains a hyperbolic
+backbone to the same accuracy and the same seed-to-seed stability as a Euclidean
+one, once it is given a learning rate suited to the objective rather than one
+inherited from cross-entropy. The energy score is markedly more lr-sensitive than
+cross-entropy — which is the practical lesson, and the reason Stage 1 looked
+alarming.
+
+`stage1_energy_head.py` now defaults to `--lr 1e-3`.
+
+---
+
 ## Where this leaves the plan
 
 | stage | status |
@@ -148,20 +227,34 @@ seed happened to favour.
 | 0 — tokenizer compatible | **confirmed** (128256, all ids valid) |
 | 0 — released checkpoint transfers | **open** — network blocked |
 | 1 — hyperbolic backbone trains under energy score | **confirmed** |
-| 1 — parity with a Euclidean backbone | **not reached** — 86.5% mean vs 99.2%, and 27-point seed spread |
+| 1 — parity with a Euclidean backbone | **confirmed** at lr 1e-3: 99.09% vs 99.23%, spread 1.36% vs 1.22% |
+| 1 — instability explained | **yes** — learning rate, not geometry |
 | 2 — K=4 with a Euclidean latent | not started |
 | 3 — hyperbolic latent | not started; §3.3 of the assessment first |
 
-Stage 1 passing is the meaningful outcome: the objection that would have killed
-this direction cheaply did not materialise. But it passed with a caveat that
-should be resolved before Stage 2, not during it — **training stability**, not
-final accuracy, is the open risk for a hyperbolic CALM.
+Stage 1 passes cleanly, and the caveat it passed with has been resolved: the
+27-point seed spread was a learning rate, not a manifold effect. At lr 1e-3 a
+hyperbolic backbone under CALM's energy score is indistinguishable from a
+Euclidean one on both mean accuracy and stability.
 
-The cheap next step is a learning-rate sweep for the CALM+HELM configuration at
-this same scale. If the seed spread collapses, it was never a geometry problem.
-If it does not, that is a real interaction worth understanding before spending a
-GPU on Stage 2.
+**Stage 2 is now the right next step.** Carry forward three things learned here:
+
+1. Use **lr ~1e-3** for the energy objective, and re-tune it if the backbone size
+   changes — cross-entropy's learning rate does not transfer.
+2. Keep `ManifoldParameter`s on the manifold. `train.py` already does this with a
+   Riemannian optimizer; any new training loop must not quietly use AdamW on
+   them, as the Stage 1 harness did.
+3. Keep `beta = 1.0`. Below 1 the energy score's self-distance term has an
+   unbounded derivative at zero and produces NaN gradients — in CALM's
+   implementation as much as ours.
 
 Stage 2's other constraints are unchanged: it needs a GPU, real training data,
 and a second evaluation stack, because CALM is likelihood-free and HELM's
 benchmark protocol is not (see `ASSESSMENT.md` §3.1).
+
+GM-VAE (`gmvae/`) was evaluated as a candidate hyperbolic latent. It is an
+elegant fit — CALM's `(mean, log_std)` output *is* a point on the Gaussian
+manifold, so a hyperbolic latent needs no change to the autoencoder's shape — but
+it is **not the next thing to do**: its contribution is numerical stability in
+hyperbolic VAEs, and the instability we had turned out not to be geometric. See
+`gmvae/ASSESSMENT.md`.

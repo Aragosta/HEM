@@ -6,17 +6,19 @@ applied to HELM-MiCE.
 
 ```
 upstream/              the CALM reference implementation, vendored (MIT)
+gmvae/                 GM-VAE, evaluated as a hyperbolic latent (Stage 3)
 estimate_helm_calm.py  measures what CALM's head would do at HELM's shapes
-experiments/           Stage 0 and Stage 1, runnable
+experiments/           Stage 0 and Stage 1, plus the stability diagnosis
 ASSESSMENT.md          does it help HELM? — the analysis
-RESULTS.md             what Stage 0 and Stage 1 actually found
+RESULTS.md             what Stages 0 and 1 actually found
 ```
 
-**Status:** Stage 0 and Stage 1 are done — see `RESULTS.md`. CALM's autoencoder
-is architecture- and tokenizer-compatible with HELM (75.8M at HELM's vocabulary,
-identical 128256-entry Llama-3 tokenizer), and a hyperbolic backbone **does**
-train under CALM's energy score. It trains less stably than a Euclidean control,
-which is the open risk.
+**Status:** Stages 0 and 1 pass — see `RESULTS.md`. CALM's autoencoder is
+architecture- and tokenizer-compatible with HELM (75.8M at HELM's vocabulary,
+identical 128256-entry Llama-3 tokenizer), and a hyperbolic backbone trains under
+CALM's energy score **as well and as stably as a Euclidean one** (99.09% vs
+99.23%, seed spread 1.36% vs 1.22%). An initial 27-point seed spread was traced
+to the learning rate, not the geometry. Stage 2 is the next step.
 
 ## What CALM does
 

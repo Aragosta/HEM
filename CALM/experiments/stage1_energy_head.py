@@ -362,7 +362,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--steps", type=int, default=300)
-    parser.add_argument("--lr", type=float, default=3e-3)
+    # 1e-3, not the 3e-3 the discrete model uses. The energy score is far more
+    # learning-rate sensitive than cross-entropy: at 3e-3 the seed spread is 27
+    # points, at 1e-3 it is 1.4. See CALM/RESULTS.md and experiments/lr_sweep.py.
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-samples", type=int, default=8)
     cli = parser.parse_args()
@@ -375,7 +378,9 @@ def main():
     print("=" * 72)
     print(f"\nbackbone: HELM-MiCE dim={args.dim}, {args.n_layers} layers, "
           f"{args.n_routed_experts} experts, vocab={args.vocab_size}")
-    print(f"task: arithmetic walk, {cli.steps} steps, lr={cli.lr}, patch size K=1\n")
+    print(f"task: arithmetic walk, {cli.steps} steps, lr={cli.lr}, patch size K=1")
+    print("note: the discrete baseline is also run at this lr; it is insensitive "
+          "to the choice\n")
 
     autoencoder, ae_accuracy = pretrain_autoencoder(args.vocab_size, batches)
     print(f"frozen K=1 autoencoder: reconstruction {ae_accuracy:.2%}, "
