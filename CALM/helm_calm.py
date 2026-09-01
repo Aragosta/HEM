@@ -31,11 +31,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from helm.hypercore.manifolds import Lorentz
+from helm.hypercore.nn.conv.conv_util_layers import LResNet, LorentzRMSNorm
 from helm.hypercore.nn.linear.lorentz_linear import LorentzLinear
 from helm.modules.helm_mice import HelmMiCE
 
-__all__ = ["LorentzPatchEmbedding", "CalmEnergyHead", "PatchAutoencoder",
-           "HelmCALM", "energy_score"]
+__all__ = ["LorentzPatchEmbedding", "CalmEnergyHead", "LorentzEnergyHead",
+           "PatchAutoencoder", "HelmCALM", "energy_score"]
 
 
 # --------------------------------------------------------------------- pieces
@@ -159,6 +160,74 @@ def energy_score(samples: torch.Tensor, mean: torch.Tensor, log_std: torch.Tenso
     return distance_x - cross.mean(dim=(0, 1)) * 2
 
 
+class LorentzEnergyHead(nn.Module):
+    """CALM's generative head rebuilt from HELM's own hyperbolic layers.
+
+    :class:`CalmEnergyHead` is Euclidean throughout: ``nn.LayerNorm``,
+    ``nn.Linear``, ``SiLU``, additive residuals. Handing it a point on a
+    hyperboloid is a category error however the input is bridged, because the
+    *internal* operations still assume a flat space.
+
+    This version keeps the same topology -- noise embedding, hidden embedding,
+    ``num_mlp_layers`` gated residual blocks, a final projection -- but built
+    from ``LorentzLinear``, ``LorentzRMSNorm`` and ``LResNet``, so every
+    intermediate activation stays on the manifold. Only the very last projection
+    leaves it, because the autoencoder's latent is Euclidean.
+    """
+
+    class Block(nn.Module):
+        def __init__(self, manifold, dim: int):
+            super().__init__()
+            self.manifold = manifold
+            self.norm = LorentzRMSNorm(manifold, dim - 1)
+            # x and y are concatenated on their space-like parts, so the input is
+            # a Lorentz vector of width 2*(dim-1)+1.
+            self.fuse = LorentzLinear(manifold, 2 * (dim - 1) + 1, 2 * (dim - 1))
+            self.proj = LorentzLinear(manifold, dim, dim - 1)
+            self.residual = LResNet(manifold, use_scale=True, scale=2.0,
+                                    learn_scale=True)
+
+        def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            joined = torch.cat([self.norm(x)[..., 1:], y[..., 1:]], dim=-1)
+            time = (joined.square().sum(-1, keepdim=True)
+                    + self.manifold.c).clamp_min(1e-8).sqrt()
+            fused = self.fuse(torch.cat([time, joined], dim=-1), return_space=True)
+            gate, up = torch.chunk(fused, 2, dim=-1)
+            space = F.silu(gate) * up
+            time = (space.square().sum(-1, keepdim=True)
+                    + self.manifold.c).clamp_min(1e-8).sqrt()
+            step = self.proj(torch.cat([time, space], dim=-1))
+            return self.residual(x, step)
+
+    def __init__(self, manifold, hidden_size: int, latent_size: int,
+                 noise_size: int = 64, num_mlp_layers: int = 4):
+        super().__init__()
+        self.manifold = manifold
+        self.noise_size = noise_size
+        self.noise_embd = LorentzLinear(manifold, noise_size + 1, hidden_size - 1)
+        self.hidden_embd = LorentzLinear(manifold, hidden_size, hidden_size - 1)
+        self.blocks = nn.ModuleList(
+            [self.Block(manifold, hidden_size) for _ in range(num_mlp_layers)])
+        self.final_norm = LorentzRMSNorm(manifold, hidden_size - 1)
+        self.final = LorentzLinear(manifold, hidden_size, latent_size)
+        # Matching CALM: start neutral so the head does not fight the backbone.
+        nn.init.zeros_(self.final.linear.weight)
+        nn.init.zeros_(self.final.linear.bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        noise = torch.rand((*hidden_states.shape[:-1], self.noise_size),
+                           dtype=hidden_states.dtype,
+                           device=hidden_states.device) - 0.5
+        time = (noise.square().sum(-1, keepdim=True)
+                + self.manifold.c).clamp_min(1e-8).sqrt()
+        h = self.noise_embd(torch.cat([time, noise], dim=-1))
+        y = self.hidden_embd(hidden_states)
+        for block in self.blocks:
+            h = block(h, y)
+        # The latent is Euclidean, so the last step leaves the manifold.
+        return self.final(self.final_norm(h), return_space=True)
+
+
 class PatchAutoencoder(nn.Module):
     """Reference K-token autoencoder, the shape of CALM's.
 
@@ -259,9 +328,39 @@ class HelmCALM(nn.Module):
     That pattern is what makes upstream's ``LorentzMoE`` unusable in eval mode.
     """
 
+    #: How the backbone's on-manifold hidden state is handed to the head.
+    #:
+    #: ``"direct"`` passes the Lorentz vector straight into CALM's Euclidean MLP,
+    #: which is what HELM's own vocabulary head does to the same tensor. But
+    #: CALM's head is not a single linear -- it opens with ``nn.LayerNorm`` over
+    #: all ``dim`` coordinates, and the Lorentz time coordinate is structurally
+    #: ``>= sqrt(c)`` and never negative (measured mean 2.46 against space-part
+    #: mean 0.00). LayerNorm therefore subtracts a mean dominated by a coordinate
+    #: that is not a feature, and the result leaves the manifold entirely
+    #: (``<x,x>_L`` drifts from -1.0 to -1.99).
+    #:
+    #: ``"space"`` drops the time coordinate; ``"logmap0"`` maps the point into
+    #: the tangent space at the origin, which is the principled Riemannian way to
+    #: hand a manifold point to a Euclidean network.
+    INPUT_MAPS = ("direct", "space", "logmap0")
+
+    #: ``"euclidean"`` is CALM's head verbatim; ``"lorentz"`` rebuilds it from
+    #: HELM's hyperbolic layers so the head's internals also stay on the manifold.
+    HEAD_KINDS = ("euclidean", "lorentz")
+
     def __init__(self, args, autoencoder, manifolds: Optional[Tuple] = None,
-                 num_samples: int = 8, beta: float = 1.0, **backbone_kwargs):
+                 num_samples: int = 8, beta: float = 1.0,
+                 input_map: str = "space", head_kind: str = "lorentz",
+                 **backbone_kwargs):
         super().__init__()
+        if input_map not in self.INPUT_MAPS:
+            raise ValueError(f"input_map must be one of {self.INPUT_MAPS}, "
+                             f"got {input_map!r}")
+        if head_kind not in self.HEAD_KINDS:
+            raise ValueError(f"head_kind must be one of {self.HEAD_KINDS}, "
+                             f"got {head_kind!r}")
+        self.input_map = input_map
+        self.head_kind = head_kind
         if manifolds is None:
             manifolds = (Lorentz(1.0), Lorentz(1.0), Lorentz(1.0))
         self.patch_size = autoencoder.patch_size
@@ -277,7 +376,16 @@ class HelmCALM(nn.Module):
 
         self.patch_embed = LorentzPatchEmbedding(manifolds[1], args.dim,
                                                  self.patch_size)
-        self.head = CalmEnergyHead(args.dim, autoencoder.latent_size)
+        if head_kind == "lorentz":
+            # A hyperbolic head consumes the manifold point unchanged.
+            self.input_map = "direct"
+            head_width = args.dim
+            self.head = LorentzEnergyHead(manifolds[2], head_width,
+                                          autoencoder.latent_size)
+        else:
+            head_width = args.dim if input_map != "space" else args.dim - 1
+            self.head = CalmEnergyHead(head_width, autoencoder.latent_size)
+        self.head_width = head_width
         self.autoencoder = autoencoder.freeze()
 
     # ---------------------------------------------------------------- plumbing
@@ -293,6 +401,18 @@ class HelmCALM(nn.Module):
             h = out[0] if isinstance(out, tuple) else out
         return backbone.norm(backbone.final_proj(h, return_space=True),
                              space_only=True)
+
+    def head_input(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Bridge the on-manifold hidden state into the head's Euclidean space."""
+        if self.input_map == "direct":
+            return hidden
+        if self.input_map == "space":
+            return hidden[..., 1:]
+        # logmap0 lands in the tangent space at the origin. Its time component
+        # is identically zero, so the head sees `dim` coordinates of which one is
+        # a constant -- harmless, and it keeps the width equal to "direct" so the
+        # two are compared at matched capacity.
+        return self.backbone.manifold_out.logmap0(hidden)
 
     def _aligned(self, tokens: torch.Tensor):
         """Split into input patches and the next-patch targets they predict."""
@@ -310,7 +430,7 @@ class HelmCALM(nn.Module):
         inputs, targets = self._aligned(tokens)
         with torch.no_grad():
             mean, log_std = self.autoencoder.encode(targets)
-        hidden = self.hidden_states(inputs).reshape(-1, self.dim)
+        hidden = self.head_input(self.hidden_states(inputs)).reshape(-1, self.head_width)
         samples = self.head(hidden.unsqueeze(0).expand(self.num_samples, -1, -1))
         return -energy_score(samples, mean, log_std, beta=self.beta).mean()
 
@@ -324,7 +444,7 @@ class HelmCALM(nn.Module):
         """
         n_samples = n_samples or self.num_samples
         inputs, targets = self._aligned(tokens)
-        hidden = self.hidden_states(inputs).reshape(-1, self.dim)
+        hidden = self.head_input(self.hidden_states(inputs)).reshape(-1, self.head_width)
         latents = self.head(hidden.unsqueeze(0).expand(n_samples, -1, -1))
         return self.autoencoder.decode(latents).argmax(-1), targets
 

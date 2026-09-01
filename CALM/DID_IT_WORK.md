@@ -94,6 +94,49 @@ vector directly rather than via `logmap0` (`NEXT.md` §4.1); the manifold
 constraint may genuinely limit what the hidden state can carry into a Euclidean
 head.
 
+## 3b. The gap was largely an interface bug — and HELM's own layers fix it
+
+The obvious follow-up: *is a layer missing at the seam between HELM and CALM?*
+Yes, and it is a concrete one.
+
+CALM's head opens with `nn.LayerNorm` over all `dim` coordinates. HELM's hidden
+state is a Lorentz vector `[x_0, x_1..d]` whose **time coordinate is structurally
+`>= sqrt(c)` and never negative** — measured mean 2.46, against a space-part mean
+of 0.00. LayerNorm subtracts a per-row mean dominated by a coordinate that is not
+a feature, and the result leaves the manifold outright: `<x,x>_L` drifts from
+−1.0 to −1.99. Every subsequent `nn.Linear`, `SiLU` and additive residual in that
+head assumes a flat space it is no longer in.
+
+Four ways of handing the backbone's output to the head, same task, same budget,
+two seeds:
+
+| head input | seed 0 | seed 1 | mean | gap to Euclidean control |
+| --- | --- | --- | --- | --- |
+| `direct` — the Lorentz vector, as originally built | 90.73% | 84.88% | 87.80% | −11.1 |
+| `logmap0` — tangent space at the origin | 91.13% | 91.13% | 91.13% | −7.8 |
+| `space` — drop the time coordinate | 95.26% | 94.15% | 94.71% | −4.2 |
+| **Lorentz head — built from HELM's own layers** | 93.65% | 96.98% | **95.31%** | **−3.6** |
+
+(References: discrete HELM 98.79%, CALM + Euclidean backbone 98.89%.)
+
+`LorentzEnergyHead` keeps CALM's exact topology — noise embedding, hidden
+embedding, four gated residual blocks, final projection — but builds it from
+`LorentzLinear`, `LorentzRMSNorm` and `LResNet`, so every intermediate activation
+stays on the manifold. Only the last projection leaves it, because the
+autoencoder's latent is Euclidean.
+
+**This recovers about 7.5 of the 11.1 point deficit.** The remaining 3.6 points
+are within the seed spread of the Lorentz head itself (93.65 vs 96.98), so
+whether anything real is left is not settled by two seeds.
+
+Worth noting that the *principled* bridge (`logmap0`) underperforms the naive one
+(`space`). `logmap0` applies a radial warp by hyperbolic distance from the origin;
+near the origin the raw space coordinates are already a serviceable Euclidean
+chart, and the warp appears to cost more than it buys at this scale. Measured,
+not predicted — the reverse was expected.
+
+`head_kind="lorentz"` is now the default.
+
 ## 4. So: did it work?
 
 | question | answer |
@@ -101,13 +144,19 @@ head.
 | Is the implementation faithful to CALM? | **Yes** — verified against their code, energy score bit-identical |
 | Does it run end to end? | **Yes** — 15 integration tests, gradients reach every component |
 | Does a hyperbolic backbone train under the energy score? | **Yes** |
-| Does it match a Euclidean backbone? | **On an easy task yes; on a harder one, no — 8–13 points behind** |
+| Does it match a Euclidean backbone? | **Close, after fixing the interface** — was 11.1 points behind, now 3.6, which is within seed noise |
+| Was a layer missing at the HELM/CALM seam? | **Yes** — CALM's Euclidean LayerNorm on a manifold point. A head built from HELM's own hyperbolic layers recovers ~7.5 of the 11.1 points |
 | Is HELM-CALM a good language model? | **Unknown, and untestable at this scale** |
 | Does patching preserve HELM's hierarchy? | **Unknown** — the instrument failed, see `HIERARCHY.md` |
 
-The finding that matters for `NEXT.md`: the risk listed there as "patching may
-blur what HELM is for" now has a companion that shows up earlier and is cheaper
-to investigate — **the hyperbolic backbone underperforms a Euclidean one under
-CALM's objective as soon as the task has structure, before patching is even
-involved.** That is measurable at small scale, unlike the hierarchy question, and
-should be chased before a GPU is spent.
+The finding that matters for `NEXT.md`: what looked like "the hyperbolic backbone
+underperforms under CALM's objective" was mostly **an interface bug, not a
+property of the geometry**. Feeding a manifold point into a Euclidean LayerNorm
+cost ~7.5 points; building the head from HELM's own layers recovers them. The
+remainder is within seed noise.
+
+That is a much better position than the previous section implied, and it
+generalises a warning to the rest of the design: **anywhere CALM's Euclidean
+machinery touches HELM's manifold activations, check the geometry before
+trusting the number.** The patch embedding was already built this way; the head
+was not, and that was worth 7.5 points.

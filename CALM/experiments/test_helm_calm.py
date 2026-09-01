@@ -282,19 +282,27 @@ def test_retraction_actually_repairs_drift(pieces):
 
 # --------------------------------------------------------------- energy score
 
-def test_backbone_gradient_is_zero_at_initialisation(pieces):
-    """Pin the zero-init behaviour, so it is not mistaken for a broken model."""
+@pytest.mark.parametrize("head_kind,final_weight", [
+    ("euclidean", lambda head: head.final_layer[-1].weight),
+    ("lorentz", lambda head: head.final.linear.weight),
+])
+def test_backbone_gradient_is_zero_at_initialisation(pieces, head_kind, final_weight):
+    """Pin the zero-init behaviour, so it is not mistaken for a broken model.
+
+    Both heads zero-initialise their final projection, as CALM does, so on step 0
+    the backbone's gradient is exactly zero.
+    """
     args, _ = pieces
     torch.manual_seed(0)
     autoencoder = PatchAutoencoder(args.vocab_size, hidden=128,
                                    latent_size=LATENT, patch_size=PATCH)
-    fresh = HelmCALM(args, autoencoder, num_samples=4)
+    fresh = HelmCALM(args, autoencoder, num_samples=4, head_kind=head_kind)
     fresh.train()
     fresh.zero_grad()
     fresh.loss(batch(args)).backward()
 
     # The head's own final projection does get a gradient; nothing before it does.
-    assert fresh.head.final_layer[-1].weight.grad.abs().max() > 0
+    assert final_weight(fresh.head).grad.abs().max() > 0
     assert fresh.backbone.embed.embedding.grad.abs().max() == 0
 
     warm_up(fresh, batch(args))
@@ -302,6 +310,42 @@ def test_backbone_gradient_is_zero_at_initialisation(pieces):
     fresh.loss(batch(args)).backward()
     assert fresh.backbone.embed.embedding.grad.abs().max() > 0, \
         "gradient should reach the backbone once the head has moved"
+
+
+def test_lorentz_head_keeps_activations_on_the_manifold(pieces):
+    """The point of LorentzEnergyHead: its internals do not leave the manifold.
+
+    CALM's Euclidean head opens with nn.LayerNorm over all `dim` coordinates,
+    including the Lorentz time coordinate -- which is structurally >= sqrt(c) and
+    never negative. That drags the point off the hyperboloid before any learned
+    layer runs. Worth ~7.5 accuracy points; see ../DID_IT_WORK.md.
+    """
+    from helm_calm import LorentzEnergyHead
+
+    args, _ = pieces
+    torch.manual_seed(0)
+    autoencoder = PatchAutoencoder(args.vocab_size, hidden=128,
+                                   latent_size=LATENT, patch_size=PATCH)
+    model = HelmCALM(args, autoencoder, num_samples=4, head_kind="lorentz")
+    assert isinstance(model.head, LorentzEnergyHead)
+    assert model.input_map == "direct", "a hyperbolic head takes the point as-is"
+
+    hidden = model.hidden_states(batch(args))
+    manifold = model.backbone.manifold_out
+    block = model.head.blocks[0]
+    with torch.no_grad():
+        y = model.head.hidden_embd(hidden)
+        noise_like = model.head.noise_embd(
+            torch.cat([torch.ones_like(y[..., :1]) * manifold.c.sqrt(),
+                       torch.zeros(*y.shape[:-1], model.head.noise_size)], dim=-1))
+        out = block(noise_like, y)
+
+    for name, tensor in (("hidden_embd", y), ("block output", out)):
+        squared = tensor ** 2
+        quad = -squared[..., :1] + squared[..., 1:].sum(-1, keepdim=True)
+        torch.testing.assert_close(
+            quad, -manifold.c.expand_as(quad), rtol=1e-3, atol=1e-3,
+            msg=lambda m, n=name: f"{n} left the manifold: {m}")
 
 
 def test_energy_score_rejects_unsafe_beta():
