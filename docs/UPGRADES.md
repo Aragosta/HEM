@@ -241,6 +241,35 @@ Implemented and timed before being dropped, rather than reasoned about:
 * **Compiling a block with the complex rope.** 0.95× — *slower*. Inductor's
   complex fallback costs more than it saves. Only worth it with the real rope.
 
+## Where this sits relative to the paper's DeepSeek comparison
+
+The paper's headline result is *quality*: HELM-MiCE beating a same-size Euclidean
+DeepSeek-V3 baseline on five multiple-choice benchmarks. Nothing here touches
+that number in either direction — every change is verified numerically equivalent
+to the released implementation (section 1), so a checkpoint scores exactly what
+it scored before. What changed is how long it takes to get there.
+
+The paper's *efficiency* argument is separate: HMLA "significantly reduces the
+memory footprint of the KV-cache". `benchmarks/compare_architectures.py` computes
+that from the code:
+
+| per token, per layer | dense MHA | Euclidean MLA | HELM HMLA |
+| --- | --- | --- | --- |
+| 120M | 498 | 82 | **81** (0.988x) |
+| 1B | 4522 | 322 | **321** (0.997x) |
+
+Two things follow. HMLA's cache saving is **MLA's saving, inherited** — 6.1x and
+14.1x against dense attention, but within a rounding error of the Euclidean MLA
+that DeepSeek-V3 already uses (one element per token, because the rotary key
+spends a coordinate on the Lorentz time component). Hyperbolic geometry is not
+what shrinks the cache; the low-rank latent is, and that is DeepSeek's idea.
+
+And the saving is only real if the latent is what gets cached. The released code
+ships its cache commented out entirely, so **the published implementation
+realises none of it** — and the first version of this port cached reconstructed
+per-head keys and values, which is the same size as dense attention. That is now
+fixed and is the default.
+
 ## Still open
 
 1. **A Triton kernel** fusing the Lorentz project-and-normalize epilogue into the
