@@ -375,7 +375,8 @@ def test_dtype_cast_preserves_rotary_table(dtype):
         assert torch.equal(model.freqs_cis, before)
 
 
-def test_model_eval_and_generation():
+@pytest.mark.parametrize("mode", ["latent", "naive"])
+def test_model_eval_and_generation(mode):
     """Full model in eval mode, and cached decoding equal to a full forward."""
     torch.manual_seed(0)
     args = tiny_args()
@@ -383,10 +384,49 @@ def test_model_eval_and_generation():
     tokens = torch.randint(0, args.vocab_size, (2, 10))
     with torch.no_grad():
         full = model(tokens)
-        caches = model.new_kv_caches(2, args.max_seq_len, dtype=torch.float64)
+        caches = model.new_kv_caches(2, args.max_seq_len, dtype=torch.float64, mode=mode)
         steps = [model(tokens[:, i:i + 1], start_pos=i, caches=caches)
                  for i in range(tokens.size(1))]
     torch.testing.assert_close(torch.cat(steps, dim=1), full, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("mode", ["latent", "naive"])
+def test_prefill_then_decode_matches_full_forward(mode):
+    """Prefill a chunk into the cache, then decode -- the mask has to stay causal.
+
+    Feeding one token at a time never exercises a multi-token query block against
+    a cache. With ``is_causal`` switched off whenever a cache was present (as it
+    briefly was here), the prefill block attended *bidirectionally* and every
+    later layer cached keys derived from the wrong hidden states -- invisible to
+    a token-at-a-time test, and invisible to greedy decoding, which only reads
+    the last position.
+    """
+    torch.manual_seed(0)
+    args = tiny_args()
+    model = HelmMiCE(args, Lorentz(1.0), Lorentz(1.0), Lorentz(1.0)).double().eval()
+    tokens = torch.randint(0, args.vocab_size, (2, 12))
+    split = 7
+    with torch.no_grad():
+        full = model(tokens)
+        caches = model.new_kv_caches(2, args.max_seq_len, dtype=torch.float64, mode=mode)
+        prefill = model(tokens[:, :split], start_pos=0, caches=caches)
+        decoded = [model(tokens[:, i:i + 1], start_pos=i, caches=caches)
+                   for i in range(split, tokens.size(1))]
+    got = torch.cat([prefill] + decoded, dim=1)
+    torch.testing.assert_close(got, full, rtol=1e-5, atol=1e-6)
+
+
+def test_latent_cache_is_smaller_than_naive():
+    """MLA's whole point: cache the latent, not the reconstructed heads."""
+    from helm.eval.presets import preset_args
+
+    for name, expected_ratio in (("helm_mice_120M", 6.0), ("helm_mice_1B", 14.0)):
+        args = preset_args(name, n_layers=1, vocab_size=256, max_seq_len=128,
+                           original_seq_len=128)
+        model = HelmMiCE(args, Lorentz(1.0), Lorentz(1.0), Lorentz(1.0)).eval()
+        latent = model.new_kv_caches(1, 128, mode="latent")[0].numel()
+        naive = model.new_kv_caches(1, 128, mode="naive")[0].numel()
+        assert naive / latent > expected_ratio, (name, naive, latent, naive / latent)
 
 
 if __name__ == "__main__":

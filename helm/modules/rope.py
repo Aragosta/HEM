@@ -95,14 +95,25 @@ def precompute_rope_cache(args) -> torch.Tensor:
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Reference (complex) rotary embedding, as published.
+    """Complex rotary embedding, as published (plus one robustness fix).
 
     Args:
         x: ``(batch, seqlen, heads, head_dim)``, ``head_dim`` even.
         freqs_cis: complex ``(seqlen, head_dim // 2)``.
     """
     dtype = x.dtype
-    x = torch.view_as_complex(x.float().contiguous().view(*x.shape[:-1], -1, 2))
+    x = x.float().contiguous()
+    # `view_as_complex` requires a storage offset divisible by 2, and
+    # `.contiguous()` does not provide one: a slice can be contiguous and still
+    # start at an odd offset. The rotary half of the key arrives here as the
+    # second piece of a `torch.split`, so whether its offset is even depends on
+    # `kv_lora_rank` -- at the released 120M shape (kv_lora_rank=65) it is odd,
+    # and single-token decoding raised
+    # "Tensor must have a storage_offset divisible by 2". `clone()` rebases to
+    # offset 0; it is a no-op copy in the common even-offset case.
+    if x.storage_offset() % 2:
+        x = x.clone()
+    x = torch.view_as_complex(x.view(*x.shape[:-1], -1, 2))
     freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)

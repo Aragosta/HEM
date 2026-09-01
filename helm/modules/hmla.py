@@ -53,15 +53,59 @@ from helm.hypercore.nn.linear.lorentz_linear import LorentzLinear
 from .rope import apply_rotary_emb, apply_rotary_emb_real
 
 
+class LorentzLatentKVCache:
+    """MLA cache: the compressed latent plus the decoupled rotary key.
+
+    This is the point of Multi-head *Latent* Attention. The keys and values of
+    every head are reconstructed on demand from one shared low-rank latent
+    ``c_KV`` (``kv_lora_rank`` wide) and a single rotary key ``k_pe`` shared
+    across heads, so what has to be stored per token is those two vectors rather
+    than a full per-head K and V.
+
+    Per token, per layer, in elements:
+
+    ===============  ==================================  ==========  =========
+    shape            stored                              latent      naive
+    ===============  ==================================  ==========  =========
+    120M             ``r=65, rope=17, H=6, qk=50, v=33``  **81**      498
+    1B               ``r=257, rope=65, H=14, qk=194,      **321**     4522
+                     v=129``
+    ===============  ==================================  ==========  =========
+
+    -- 6.1x and 14.1x less cache memory respectively. The trade is that
+    ``wkv_b`` has to be re-applied to the cached latent each step, which is
+    linear in context length; :class:`LorentzKVCache` stores the reconstructed
+    keys and values instead if you would rather spend the memory.
+    """
+
+    def __init__(self, max_batch_size: int, max_seq_len: int, kv_lora_rank: int,
+                 rope_dim: int, dtype: torch.dtype, device: torch.device):
+        self.kv = torch.zeros(max_batch_size, max_seq_len, kv_lora_rank,
+                              dtype=dtype, device=device)
+        self.pe = torch.zeros(max_batch_size, max_seq_len, rope_dim,
+                              dtype=dtype, device=device)
+
+    def update(self, kv: torch.Tensor, pe: torch.Tensor, start_pos: int
+               ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Append ``(B, S, r)`` latents and ``(B, S, rope)`` rotary keys; return the prefix."""
+        bsz, seqlen, _ = kv.shape
+        end = start_pos + seqlen
+        self.kv[:bsz, start_pos:end] = kv
+        self.pe[:bsz, start_pos:end] = pe
+        return self.kv[:bsz, :end], self.pe[:bsz, :end]
+
+    def numel(self) -> int:
+        """Elements held, for reporting."""
+        return self.kv.numel() + self.pe.numel()
+
+
 class LorentzKVCache:
-    """Per-layer key/value cache for incremental decoding.
+    """Naive cache: the reconstructed on-manifold keys and values, per head.
 
-    Stores the *projected* (on-manifold) keys and values, so a decode step costs
-    one row of work instead of re-running the prefix.
-
-    Upstream ships with its cache commented out, which means generation and
-    ``lm-evaluation-harness`` scoring re-run the entire prefix for every token --
-    O(N^2) forward passes over a sequence instead of O(N).
+    Larger than :class:`LorentzLatentKVCache` by roughly
+    ``H(qk + v) / (r + rope)`` -- 6x at the 120M shape, 14x at 1B -- but it skips
+    the ``wkv_b`` reconstruction on every decode step. Worth it only for short
+    contexts, where the cache is small anyway.
     """
 
     def __init__(self, max_batch_size: int, max_seq_len: int, n_heads: int,
@@ -80,6 +124,10 @@ class LorentzKVCache:
         self.k[:bsz, :, start_pos:end] = k
         self.v[:bsz, :, start_pos:end] = v
         return self.k[:bsz, :, :end], self.v[:bsz, :, :end]
+
+    def numel(self) -> int:
+        """Elements held, for reporting."""
+        return self.k.numel() + self.v.numel()
 
 
 class LorentzMLA(nn.Module):
@@ -218,8 +266,9 @@ class LorentzMLA(nn.Module):
             mask: ``True`` == masked. Any shape :meth:`shape_mask` accepts.
             is_causal: apply a causal mask without materialising one. Mutually
                 exclusive with ``mask``.
-            cache: if given, keys/values are appended to it and attention runs
-                over the whole prefix.
+            cache: :class:`LorentzLatentKVCache` (compressed, the MLA way) or
+                :class:`LorentzKVCache` (reconstructed keys/values). Either way
+                attention runs over the whole cached prefix.
 
         Returns:
             ``(B, N, dim)`` on the manifold.
@@ -244,16 +293,26 @@ class LorentzMLA(nn.Module):
         k_pe = rope(k_pe.unsqueeze(2), freqs_cis)
 
         q = torch.cat([q_nope, q_pe], dim=-1)
+
+        latent_cache = isinstance(cache, LorentzLatentKVCache)
+        if latent_cache:
+            # Cache before reconstruction: this is what makes the cache latent.
+            kv, pe_all = cache.update(kv, k_pe.squeeze(2), start_pos)
+            k_pe = pe_all.unsqueeze(2)
+
         kv = self.wkv_b(self.kv_norm(kv, space_only=True), return_space=True)
-        kv = kv.view(bsz, seqlen, self.n_local_heads,
+        kv = kv.view(bsz, kv.size(1), self.n_local_heads,
                      self.qk_nope_head_dim + self.v_head_dim - 1)
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim - 1], dim=-1)
         k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
 
+        naive_cache = cache if isinstance(cache, LorentzKVCache) else None
         if self.attn_impl == "flash":
-            out = self._attend_flash(q, k, v, bsz, seqlen, mask, is_causal, start_pos, cache)
+            out = self._attend_flash(q, k, v, bsz, seqlen, mask, is_causal, start_pos,
+                                     naive_cache)
         else:
-            out = self._attend_naive(q, k, v, bsz, seqlen, mask, is_causal, start_pos, cache)
+            out = self._attend_naive(q, k, v, bsz, seqlen, mask, is_causal, start_pos,
+                                     naive_cache)
         return self.wo(out.flatten(2))
 
     def _attend_flash(self, q, k, v, bsz, seqlen, mask, is_causal, start_pos, cache):

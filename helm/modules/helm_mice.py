@@ -46,7 +46,7 @@ from helm.hypercore.nn.conv.conv_util_layers import LResNet, LorentzRMSNorm
 from helm.hypercore.nn.linear.lorentz_linear import LorentzLinear
 
 from .fused_ce import fused_linear_cross_entropy
-from .hmla import LorentzKVCache, LorentzMLA
+from .hmla import LorentzKVCache, LorentzLatentKVCache, LorentzMLA
 from .lorentz_ops import LorentzResidual
 from .mice import LorentzMoE, LorentzSwiGLU
 from .rope import precompute_freqs_cis, precompute_rope_cache
@@ -178,11 +178,34 @@ class HelmMiCE(nn.Module):
 
     def new_kv_caches(self, max_batch_size: int, max_seq_len: Optional[int] = None,
                       dtype: Optional[torch.dtype] = None,
-                      device: Optional[torch.device] = None) -> List[LorentzKVCache]:
-        """Allocate one :class:`LorentzKVCache` per layer, for incremental decoding."""
+                      device: Optional[torch.device] = None,
+                      mode: str = "latent") -> List:
+        """Allocate one KV cache per layer, for incremental decoding.
+
+        Args:
+            max_batch_size: rows to reserve.
+            max_seq_len: positions to reserve; defaults to the context length.
+            dtype / device: default to the head's.
+            mode: ``"latent"`` (default) caches the compressed MLA latent and the
+                shared rotary key -- 6x smaller at the 120M shape, 14x at 1B.
+                ``"naive"`` caches the reconstructed per-head keys and values,
+                spending that memory to skip the ``wkv_b`` reconstruction each
+                step.
+
+        Returns:
+            One cache per layer, to pass as ``caches=``.
+        """
+        if mode not in ("latent", "naive"):
+            raise ValueError(f"mode must be 'latent' or 'naive', got {mode!r}")
         max_seq_len = max_seq_len or self.max_seq_len
         device = device or self.head.weight.device
         dtype = dtype or self.head.weight.dtype
+        if mode == "latent":
+            return [LorentzLatentKVCache(max_batch_size, max_seq_len,
+                                         layer.attn.kv_lora_rank,
+                                         layer.attn.qk_rope_head_dim - 1,
+                                         dtype=dtype, device=device)
+                    for layer in self.layers]
         return [LorentzKVCache(max_batch_size, max_seq_len, layer.attn.n_local_heads,
                                layer.attn.qk_head_dim, layer.attn.v_head_dim,
                                dtype=dtype, device=device)
@@ -216,15 +239,26 @@ class HelmMiCE(nn.Module):
         freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
 
         # `is_causal=True` costs nothing and lets the flash kernel skip the whole
-        # upper triangle; only fall back to an explicit mask when packing gives
-        # us a document mask that a causal flag cannot express.
-        is_causal = attn_mask is None and caches is None
+        # upper triangle; only fall back to an explicit mask when a document mask
+        # or a cache offset makes a plain causal flag insufficient.
         mask = None
+        is_causal = False
         if attn_mask is not None:
             causal = self.attn_mask[start_pos:start_pos + seqlen, :start_pos + seqlen]
             if attn_mask.dim() == 3:
                 attn_mask = attn_mask.unsqueeze(1)      # (B, N, N) -> (B, 1, N, N)
             mask = causal | attn_mask
+        elif seqlen == 1:
+            # Decoding: the single query legitimately attends to every cached
+            # key, all of which precede it.
+            pass
+        elif start_pos == 0:
+            is_causal = True
+        else:
+            # Chunked prefill into a cache: `is_causal` would align the triangle
+            # to the top left of a non-square (seqlen x start_pos+seqlen) score
+            # block, which is not the mask we want. Slice the absolute one.
+            mask = self.attn_mask[start_pos:start_pos + seqlen, :start_pos + seqlen]
 
         if self.training:
             all_indices: List[torch.Tensor] = []

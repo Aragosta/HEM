@@ -14,12 +14,19 @@ original.
 
 ```
 helm/modules/     optimized HMLA, MiCE and the model
+helm/eval/        lm-evaluation-harness plugin, batched scoring, generation
 helm/reference/   the published modules, unmodified
 helm/hypercore/   vendored HyperCore layers (graph datasets dropped)
-tests/            32 parity and regression tests
+tests/            71 parity and regression tests
 benchmarks/       reference vs optimized, timing + memory + op counts
 docs/             what changed and why
 ```
+
+Deliberately not ported from upstream: `figure/` (images),
+`helm/hypercore/data/` (219 MB of graph-learning datasets, unrelated to the
+language model), and the 47 MB vendored `lm-evaluation-harness/` fork — whose
+HELM-specific parts are reimplemented in `helm/eval/` as a plugin, so the model
+code exists once instead of twice. Everything else is present.
 
 ## Install
 
@@ -54,10 +61,30 @@ with torch.no_grad():
 Incremental decoding, using the KV cache that upstream ships commented out:
 
 ```python
-caches = model.new_kv_caches(max_batch_size=2)
-for i in range(tokens.size(1)):
+caches = model.new_kv_caches(max_batch_size=2)      # latent (MLA) cache
+logits = model(tokens[:, :prefill], caches=caches)  # prefill
+for i in range(prefill, tokens.size(1)):
     logits = model(tokens[:, i:i + 1], start_pos=i, caches=caches)
 ```
+
+The cache stores the compressed MLA latent and the shared rotary key, not the
+reconstructed per-head keys and values — **6.1× smaller at the 120M shape,
+14.1× at 1B**. Pass `mode="naive"` to spend that memory instead and skip the
+`wkv_b` reconstruction each step.
+
+## Evaluate
+
+```bash
+lm_eval --model helm_mice_120M \
+        --model_args ckpt_dir=/path/to/Step1000.pt,batch_size=16 \
+        --tasks hellaswag,arc_challenge --num_fewshot 0
+```
+
+`helm/eval/` registers `helm_mice_120M`, `helm_mice_1B` and `helm_d_115M` against
+an installed `lm_eval`. It batches requests (the original scores one continuation
+per forward pass and ignores `batch_size`), gathers log-probabilities vectorised,
+and implements `generate_until` and `loglikelihood_rolling` — neither of which
+works upstream.
 
 Checkpoints are interchangeable with the reference in both directions:
 
@@ -124,7 +151,7 @@ python benchmarks/bench_helm_mice.py --preset 120m --seq-len 2048 --dtype bfloat
 Yes — and the tests are built to demonstrate it rather than assert it.
 
 ```bash
-python -m pytest tests/ -q       # 55 tests
+python -m pytest tests/ -q       # 71 tests
 ```
 
 * **Turn every rewrite off and it is bit-identical.** `attn_impl="naive"`,
@@ -149,8 +176,11 @@ python -m pytest tests/ -q       # 55 tests
 
 The one deliberate difference is the attention bias, a scalar added to every
 score before a softmax — it provably cannot change any output, so it is frozen
-here while upstream trains it on round-off. Details in
-[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md).
+here while upstream trains it on round-off.
+
+Details in **[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md)** (the attention
+and MoE rewrites) and **[`docs/UPGRADES.md`](docs/UPGRADES.md)** (the fused head,
+the latent KV cache, the evaluation port, and what was measured and rejected).
 
 ## What was wrong with the original
 
