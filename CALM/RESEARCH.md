@@ -15,9 +15,19 @@ numerical stability as *a common limitation of previous hyperbolic VAEs*, and
 locate it specifically in the geodesic distance of hyperbolic space
 ([Hyperbolic VAE via Latent Gaussian Distributions](https://arxiv.org/pdf/2209.15217)).
 
-So the correct reading of our 2.29% patch reconstruction is not "hyperbolic
+So the correct reading of our early wrapped-normal numbers is not "hyperbolic
 latents do not work". It is "we picked the parameterisation the literature warns
 about, and got the failure the literature predicts."
+
+**Correction to the numbers this document originally quoted.** It cited 2.29%
+held-out per-patch reconstruction for the wrapped normal as a fact about our
+implementation. It is not. In an otherwise identical run -- same model, data,
+budget and radius clamp -- the wrapped normal scores **80.91%**; the two runs
+differ only in that the second clips gradient norms and skips non-finite steps.
+A figure quoted from a single uncontrolled run is not a property of the method,
+and this one was repeated several times before that was noticed. Gradient
+clipping is now an explicit variable in `latent_geometry.py` rather than an
+incidental convenience.
 
 ## 2. GM-VAE removes the failure structurally, not by clamping
 
@@ -81,11 +91,34 @@ CALM-style model in float32"*, argued from the radius budget. That argument is
 sound about the wrapped normal on the hyperboloid and does not generalise. GM-VAE
 sidesteps it by construction.
 
-**Unchanged, because it is measured.** With a *working* wrapped-normal
-implementation (clamped, finite, no NaN), the Euclidean autoencoder reconstructs
-held-out K=4 byte patches at **89.11%** against the hyperbolic one's **2.29%**.
-That number stands as a fact about our implementation. It is now attributable to
-the parameterisation rather than to the geometry.
+**Superseded.** This section originally reported the Euclidean autoencoder at
+89.11% against the wrapped normal's 2.29% and called the second a fact about our
+implementation. Both figures came from single unclipped runs. Under controlled
+conditions -- gradient clipping on, non-finite steps skipped, one seed, latent 16
+-- the picture is different and much closer:
+
+| latent | held-out per patch | radius | pinned against a clamp | KL |
+| --- | --- | --- | --- | --- |
+| euclidean | 87.83% | 10.24 (max 18.08) | 0.0% | 92.34 |
+| wrapped normal | 80.91% | 5.00 (max 5.00) | **100.0%** | 68.50 |
+| product (GM-VAE) | 88.34% | 18.18 (max 36.59) | 48.7% | 72.76 |
+| product, learnable curvature | **89.42%** | 32.35 (max 70.29) | 47.6% | 98.95 |
+
+Read the `pinned` column before the accuracy column. The wrapped normal is
+against its radius clamp for the whole batch, and both product latents for half
+of theirs, so three of those four accuracies are partly measurements of our own
+hyperparameters rather than of geometry. Re-running with non-binding clamps
+across seeds is what decides whether the ordering is real.
+
+**The one number that explains the wrapped normal's ceiling.** The Euclidean
+latent, which is unconstrained, settles at radius **10.24 and reaches 18.08**.
+Float32 on the hyperboloid fails past about **8**. So this task wants more
+dynamic range than that parameterisation has, and the wrapped normal's earlier
+drift to radius 22 was not pathology -- it was the model reaching for the range
+it needed and falling off the representable edge. The product latent has the
+range because only its *variance* coordinate is logarithmic while its mean
+coordinate is unbounded, which is precisely the combination the wrapped normal
+cannot offer.
 
 **Unchanged, because it is structural.** The bridge finding: HELM's time
 coordinate at the head is constant (std exactly 0), so dropping it before CALM's
