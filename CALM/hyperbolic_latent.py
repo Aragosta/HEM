@@ -68,6 +68,32 @@ __all__ = ["lorentz_distance", "lorentz_energy_score", "WrappedNormal",
 
 _EPS = 1e-12
 
+#: Largest tangent radius at which a Lorentz point survives float32.
+#:
+#: On the hyperboloid the coordinates grow as ``cosh(r)``, so the constraint
+#: ``-x0^2 + |xs|^2 = -c`` requires cancelling two quantities of size
+#: ``cosh(r)^2 ~ e^(2r)/4`` and landing on exactly ``-c``. float32 carries ~7
+#: significant digits, so the absolute error in that cancellation is roughly
+#: ``6e-8 * e^(2r)/4``. Measured:
+#:
+#: ===========  =========  ==========================
+#: radius       ``x0``     ``|<x,x>_L + c|``
+#: ===========  =========  ==========================
+#: 4                 27.3  0.0
+#: 6                201.7  0.0039
+#: 8               1490.5  0.25
+#: 10             11013.2  1.0  (as large as the constraint)
+#: ===========  =========  ==========================
+#:
+#: Past radius ~8 the point is not on the manifold in any meaningful sense, and
+#: ``expmap``/``transp`` on it produce NaN. This is a property of the
+#: representation, not of any one implementation: **hyperbolic space in float32
+#: has a usable radius budget of about 6 nats**, and every hyperbolic model has
+#: to live inside it or carry points in float64.
+#:
+#: 5.0 leaves roughly two orders of magnitude of headroom.
+MAX_TANGENT_RADIUS = 5.0
+
 
 # ------------------------------------------------------------------- geometry
 
@@ -157,6 +183,21 @@ class WrappedNormal:
             tangent space -- one fewer than ``mean`` because the tangent space at
             a point of the ``d``-dimensional hyperboloid is ``d``-dimensional.
     """
+
+    @staticmethod
+    def clamp_tangent(tangent: torch.Tensor,
+                      max_radius: float = MAX_TANGENT_RADIUS) -> torch.Tensor:
+        """Rescale tangent vectors longer than ``max_radius`` back onto that ball.
+
+        Direction is preserved and the map is differentiable, so this constrains
+        the posterior rather than truncating its gradient. Without it a wrapped
+        normal trained with any useful capacity walks straight out of float32:
+        measured here, the posterior reached radius 9.46 after nine steps at
+        latent width 32 and produced NaN in both the sample and the KL. See
+        :data:`MAX_TANGENT_RADIUS`.
+        """
+        radius = tangent.norm(dim=-1, keepdim=True).clamp_min(_EPS)
+        return tangent * (radius.clamp(max=max_radius) / radius)
 
     def __init__(self, manifold: Lorentz, mean: torch.Tensor, log_std: torch.Tensor):
         if mean.shape[-1] != log_std.shape[-1] + 1:
@@ -255,11 +296,13 @@ class LorentzPatchAutoencoder(nn.Module):
 
     def __init__(self, vocab_size: int, hidden: int = 256, latent_size: int = 128,
                  patch_size: int = 4, layers: int = 2,
-                 manifold: Optional[Lorentz] = None):
+                 manifold: Optional[Lorentz] = None,
+                 max_radius: float = MAX_TANGENT_RADIUS):
         super().__init__()
         from CALM.helm_calm import PatchAutoencoder  # same Block, no duplication
 
         self.manifold = manifold if manifold is not None else Lorentz(1.0)
+        self.max_radius = max_radius
         self.patch_size = patch_size
         self.latent_size = latent_size
         Block = PatchAutoencoder.Block
@@ -297,7 +340,7 @@ class LorentzPatchAutoencoder(nn.Module):
         for block in self.enc_b:
             h = block(h)
         h = self.enc_norm(h)
-        tangent = self.to_mean(h)
+        tangent = WrappedNormal.clamp_tangent(self.to_mean(h), self.max_radius)
         mean = self.manifold.expmap0(
             torch.cat([torch.zeros_like(tangent[..., :1]), tangent], dim=-1))
         return WrappedNormal(self.manifold, mean,

@@ -321,3 +321,58 @@ def test_training_reduces_the_loss():
     assert all(math.isfinite(v) for v in losses)
     assert sum(losses[-10:]) / 10 < sum(losses[:10]) / 10
     assert model.manifold_violation().item() < 1e-4
+
+
+# ------------------------------------------------- float32 radius budget
+
+def test_constraint_degrades_past_radius_eight(manifold):
+    """The measurement behind MAX_TANGENT_RADIUS, kept as a regression guard.
+
+    Coordinates grow as cosh(r), so the hyperboloid constraint asks float32 to
+    cancel two quantities of size e^(2r)/4 and land on -c. Past radius ~8 that
+    cancellation is below the noise floor and the point is no longer on the
+    manifold in any useful sense.
+    """
+    def error(radius):
+        tangent = torch.zeros(1, 32)
+        tangent[0, 0] = radius
+        point = manifold.expmap0(torch.cat([torch.zeros(1, 1), tangent], -1))
+        return on_manifold(point)
+
+    assert error(4.0) < 1e-4
+    assert error(6.0) < 1e-2
+    assert error(10.0) > 0.5      # error as large as the constraint itself
+
+
+def test_clamp_keeps_the_posterior_representable():
+    """Without the clamp the wrapped normal walks out of float32 and NaNs.
+
+    Measured before the fix: radius 9.46 after nine steps at latent width 32,
+    with NaN in both the sample and the KL.
+    """
+    from hyperbolic_latent import MAX_TANGENT_RADIUS, WrappedNormal as WN
+    tangent = torch.randn(64, 32) * 10.0
+    clamped = WN.clamp_tangent(tangent)
+    assert clamped.norm(dim=-1).max() <= MAX_TANGENT_RADIUS + 1e-5
+    # Direction preserved, and differentiable rather than truncated.
+    short = torch.randn(8, 32) * 0.01
+    assert torch.allclose(WN.clamp_tangent(short), short, atol=1e-6)
+    live = (torch.randn(4, 32) * 10.0).requires_grad_(True)
+    WN.clamp_tangent(live).sum().backward()
+    assert torch.isfinite(live.grad).all() and live.grad.abs().sum() > 0
+
+
+def test_autoencoder_survives_a_wide_latent():
+    """Latent width 64 NaN'd within five steps before the clamp."""
+    torch.manual_seed(0)
+    model = LorentzPatchAutoencoder(97, hidden=64, latent_size=64, patch_size=2,
+                                    layers=1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    generator = torch.Generator().manual_seed(0)
+    for _ in range(60):
+        ids = torch.randint(0, 97, (128, 2), generator=generator)
+        loss, _ = model.elbo(ids)
+        assert torch.isfinite(loss), "wrapped normal left float32"
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
