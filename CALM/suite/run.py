@@ -55,7 +55,7 @@ from helm_calm import PatchAutoencoder  # noqa: E402
 from models import (CELLS, EuclideanCalm, EuclideanDiscrete,  # noqa: E402
                     build_helm_calm, build_helm_discrete, count_parameters,
                     describe, match_euclidean_width)
-from real_text import VOCAB, batches_from, build_corpus  # noqa: E402
+from corpus import batches_from, load, overlap_report  # noqa: E402
 from tests._config import tiny_args  # noqa: E402
 
 TIERS = {
@@ -71,7 +71,7 @@ TIERS = {
 }
 
 
-def helm_args(cfg, patch: int):
+def helm_args(cfg, vocab: int):
     """A HELM config at the tier's shape, with the structural constraints kept.
 
     ``dim`` odd so ``dim - 1`` is even, rope dim odd, kv_lora_rank odd -- the
@@ -79,7 +79,7 @@ def helm_args(cfg, patch: int):
     shape error, not a silently different model, which is the good case.
     """
     head = max(((cfg["dim"] - 1) // cfg["heads"]) // 2 * 2 + 1, 5)
-    return tiny_args(vocab_size=VOCAB, dim=cfg["dim"], n_layers=cfg["layers"],
+    return tiny_args(vocab_size=vocab, dim=cfg["dim"], n_layers=cfg["layers"],
                      n_heads=cfg["heads"], max_seq_len=cfg["seq_len"],
                      original_seq_len=cfg["seq_len"], max_batch_size=cfg["batch"],
                      qk_nope_head_dim=head, qk_rope_head_dim=head,
@@ -88,9 +88,9 @@ def helm_args(cfg, patch: int):
                      mice_inter_dim=cfg["dim"] + 31)
 
 
-def train_autoencoder(train, cfg, patch, device, seed=0):
+def train_autoencoder(train, cfg, patch, device, vocab, seed=0):
     torch.manual_seed(seed)
-    ae = PatchAutoencoder(VOCAB, hidden=4 * cfg["dim"], latent_size=cfg["latent"],
+    ae = PatchAutoencoder(vocab, hidden=4 * cfg["dim"], latent_size=cfg["latent"],
                           patch_size=patch).to(device)
     optimizer = torch.optim.AdamW(ae.parameters(), lr=3e-3)
     generator = torch.Generator().manual_seed(seed)
@@ -114,7 +114,7 @@ def autoencoder_ceiling(ae, data, patch, device):
 
 
 def run_cell(name, cfg, args, ae, train_batches, eval_batches, patch, device,
-             seed, lr=1e-3):
+             seed, vocab, lr=1e-3):
     """Train one cell and collect everything the design asks of it."""
     torch.manual_seed(seed)
     is_helm = name.startswith("helm")
@@ -127,12 +127,12 @@ def run_cell(name, cfg, args, ae, train_batches, eval_batches, patch, device,
         model = build_helm_calm(args, ae).to(device)
         step_loss = model.loss
     elif name == "euclid_discrete":
-        model = EuclideanDiscrete(VOCAB, cfg["euclid_dim"], cfg["layers"],
+        model = EuclideanDiscrete(vocab, cfg["euclid_dim"], cfg["layers"],
                                   cfg["heads"], 2 * cfg["euclid_dim"],
                                   cfg["seq_len"]).to(device)
         step_loss = model.loss
     else:
-        model = EuclideanCalm(VOCAB, cfg["euclid_dim"], cfg["layers"],
+        model = EuclideanCalm(vocab, cfg["euclid_dim"], cfg["layers"],
                               cfg["heads"], 2 * cfg["euclid_dim"], patch,
                               ae.latent_size, cfg["seq_len"]).to(device)
         step_loss = lambda t: model.loss(t, ae)
@@ -250,6 +250,12 @@ def main():
     parser.add_argument("--patch", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--corpus", default="wikitext2",
+                        choices=("wikitext2", "ptb"))
+    parser.add_argument("--level", default="byte", choices=("byte", "word"))
+    parser.add_argument("--limit", type=int, default=0,
+                        help="truncate each split; smoke tests only, and it "
+                             "changes what is being measured")
     parser.add_argument("--cells", default=",".join(CELLS))
     parser.add_argument("--out", default="")
     options = parser.parse_args()
@@ -259,27 +265,34 @@ def main():
     seeds = [int(v) for v in options.seeds.split(",")]
     cells = options.cells.split(",")
 
-    train, valid = build_corpus()
+    corpus = load(options.corpus, options.level, options.limit or None)
+    vocab = corpus.vocab_size
+    train, valid = corpus.train, corpus.valid
     train_batches = [b.to(device) for b in batches_from(
         train, cfg["batch"], cfg["seq_len"], cfg["train_batches"], seed=0)]
     eval_batches = [b.to(device) for b in batches_from(
         valid, cfg["batch"], cfg["seq_len"], cfg["eval_batches"], seed=1)]
 
-    args = helm_args(cfg, options.patch)
-    ae = train_autoencoder(train, cfg, options.patch, device)
+    args = helm_args(cfg, vocab)
+    ae = train_autoencoder(train, cfg, options.patch, device, vocab)
     ceiling = autoencoder_ceiling(ae, valid, options.patch, device)
 
     # Match the Euclidean width to HELM's parameter count before anything trains.
     width, euclid_params, helm_params = match_euclidean_width(
         lambda: build_helm_discrete(args),
-        lambda w: EuclideanDiscrete(VOCAB, w, cfg["layers"], cfg["heads"],
+        lambda w: EuclideanDiscrete(vocab, w, cfg["layers"], cfg["heads"],
                                     2 * w, cfg["seq_len"]))
     cfg["euclid_dim"] = width
     budget = describe(build_helm_discrete(args), args, cfg["seq_len"], is_helm=True)
 
-    base = M.lookup_baselines(train, [b.cpu() for b in eval_batches])
+    base = M.lookup_baselines(train, [b.cpu() for b in eval_batches], vocab)
     print(f"tier {options.tier}  K={options.patch}  seeds {seeds}  device {device}")
-    print(f"corpus {train.numel():,} train / {valid.numel():,} held-out bytes")
+    print(corpus.describe())
+    print(f"  digests {corpus.digests}")
+    if not options.limit:
+        overlap = overlap_report(corpus)["verbatim_fraction"]
+        print(f"  16-gram verbatim overlap valid->train: {overlap:.2%}"
+              f"{'  -- some held-out accuracy is recall' if overlap > 0.05 else ''}")
     print(f"HELM {helm_params:,} params ({budget.active:,} active/token) vs "
           f"Euclidean width {width} at {euclid_params:,} "
           f"({(euclid_params - helm_params) / helm_params:+.1%})")
@@ -292,7 +305,7 @@ def main():
     for cell in cells:
         for seed in seeds:
             row = run_cell(cell, cfg, args, ae, train_batches, eval_batches,
-                           options.patch, device, seed, options.lr)
+                           options.patch, device, seed, vocab, options.lr)
             rows.append(row)
             bpb = f"{row['bpb']:.4f}" if row["bpb"] is not None else "n/a"
             print(f"{cell:16s} seed {seed}  top1 {row['top1']:7.2%}  BPB {bpb:>8s}  "
