@@ -157,3 +157,84 @@ the above:
 Those are claims about code being right. Section 2 and 3 are about the model
 being good, and on that question this repository currently has very little to
 say.
+
+## 6. What the results mean — and what they do not say about HELM
+
+Written in answer to: *we know standard HELM is a good model.*
+
+Yes — and **nothing in this repository measures that, in either direction.**
+Worth separating three things that have been running together.
+
+### HELM's quality is inherited, not measured
+
+Every quality claim about HELM here is one of two kinds:
+
+1. a **citation** of the paper's published numbers, or
+2. a proof that our optimized implementation is **numerically equivalent** to
+   the original one, to ULP-calibrated tolerance.
+
+(2) is the load-bearing result of the whole optimization effort, and it is
+strong — but note what it is. It says *if* standard HELM is a good model, then
+the optimized HELM is exactly as good, because it computes the same function,
+2.09× faster on a training step. It is a statement about code, not about
+learning. We have never trained HELM on real text and measured it, and the
+lm-eval harness plugin has never been run against a task.
+
+So "standard HELM is a good model" is a premise here, taken from the paper. None
+of the CALM experiments test it, threaten it, or support it.
+
+### The CALM experiments test something else entirely
+
+HELM-CALM is a thing **we built**: HELM's backbone with CALM's continuous head
+and energy-score objective replacing the token cross-entropy. When it
+underperforms, the candidate explanations are our construction, the objective,
+the scale, the data, and the geometry — in roughly that order of likelihood.
+Reading those results as evidence about hyperbolic geometry, or about HELM,
+skips every more probable cause.
+
+The clearest illustration is already on the record: an 11.1-point deficit that
+looked like "the hyperbolic backbone underperforms under CALM's objective"
+turned out to be **one Euclidean LayerNorm applied to a manifold point**. Fixing
+that interface recovered 7.5 points. The geometry was never the problem; our
+seam was.
+
+### The held-out split says neither arm learned anything
+
+This is the finding that reframes the rest. With a proper held-out split, the
+**Euclidean control** — the arm that scored 99.09% and "won" the five-seed
+comparison — scores:
+
+| | held out |
+| --- | --- |
+| uniform chance (64 leaves) | 1.56% |
+| unigram mode | 1.27% |
+| **CALM + Euclidean control** | **9.23%** |
+| **bigram lookup table**, fitted on train, scored on held out | **19.86%** |
+| bigram ceiling (best possible Markov-1 model) | 32.26% |
+
+The 99.09% model scores **less than half of what a bigram lookup table gets**.
+A table. No parameters, no training, no gradient — just "what usually follows
+this token", counted. Against 99.09% on the training data, that is
+memorisation with essentially nothing transferable learned.
+
+Which retires the headline number: **the 2.94-point gap was a difference in
+memorisation capacity between two models that both fail to generalise.** It was
+measured correctly, it is statistically real, and it is not evidence about which
+architecture is the better language model, because at this scale neither is a
+language model at all. 1024 training tokens over 4000 steps is roughly 250
+epochs on a corpus the model can simply store.
+
+### What that leaves standing
+
+| claim | status |
+| --- | --- |
+| Optimized HELM computes the same function as original HELM | **Proven**, ULP-calibrated |
+| Optimized HELM is faster (2.09× step, 1.71× attention, 2.8× head memory) | **Measured** on CPU |
+| ~9 upstream bugs found and fixed | **Demonstrated by construction** |
+| The geometry in `hyperbolic_latent.py` is correct | **Verified** against geoopt, numerical integration, and propriety |
+| HELM is a good language model | **Assumed** from the paper — never measured here |
+| HELM-CALM is a good language model | **Unknown**, and these experiments cannot answer it |
+| Hyperbolic geometry helps or hurts under CALM's objective | **Unknown** — the one clean finding was an interface bug, not geometry |
+
+The correctness work is unaffected by any of this, because it never depended on
+a benchmark. The modelling questions are open and need the scale in §4 to close.

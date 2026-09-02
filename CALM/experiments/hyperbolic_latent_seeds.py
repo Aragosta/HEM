@@ -150,6 +150,43 @@ def run_euclidean(autoencoder, seed, width=33):
     return accuracy(BATCHES), accuracy(HELD_OUT)
 
 
+def baselines():
+    """Reference points that make a held-out accuracy interpretable.
+
+    A neural number in isolation says nothing. The one that matters is the
+    **bigram lookup table** fitted on the training batches and evaluated on the
+    held-out ones: it involves no learning whatsoever, so any model that fails to
+    beat it has not learned the language, whatever its training accuracy.
+    """
+    import collections
+    train = torch.cat([b.reshape(-1) for b in BATCHES])
+    counts = collections.Counter(train.tolist())
+    mode = counts.most_common(1)[0][0]
+
+    def pairs(batches):
+        for batch in batches:
+            for row in batch:
+                yield from zip(row[:-1].tolist(), row[1:].tolist())
+
+    following = collections.defaultdict(collections.Counter)
+    for previous, nxt in pairs(BATCHES):
+        following[previous][nxt] += 1
+    best = {k: v.most_common(1)[0][0] for k, v in following.items()}
+    held = list(pairs(HELD_OUT))
+    bigram = sum(best.get(a, mode) == b for a, b in held) / len(held)
+
+    held_counts = collections.defaultdict(collections.Counter)
+    for previous, nxt in held:
+        held_counts[previous][nxt] += 1
+    ceiling = (sum(v.most_common(1)[0][1] for v in held_counts.values())
+               / sum(sum(v.values()) for v in held_counts.values()))
+    return {"uniform": 1.0 / LANGUAGE.vocab_size,
+            "unigram mode": (torch.cat([b.reshape(-1) for b in HELD_OUT])
+                             == mode).float().mean().item(),
+            "bigram table (train -> held out)": bigram,
+            "bigram ceiling (held out -> itself)": ceiling}
+
+
 def summarise(name, results, ceiling):
     """``results`` is a list of ``(train, held_out)`` pairs, one per seed."""
     train = [t for t, _ in results]
@@ -177,6 +214,8 @@ def main():
           "they were fitted to")
     print(f"{'':34s} {header} {'mean':>8s}{'sd':>7s}  {'of ceil':>7s}  "
           f"{'train':>7s}")
+    for label, value in baselines().items():
+        print(f"{'  [baseline] ' + label:34s} {'':39s} {value:8.2%}")
 
     control = summarise("CALM + Euclidean (control)",
                         [run_euclidean(euclidean_ae, s) for s in SEEDS],
