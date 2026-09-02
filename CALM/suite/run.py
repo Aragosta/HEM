@@ -160,11 +160,17 @@ def run_cell(name, cfg, args, ae, train_stream, eval_batches, patch, device,
     model.eval()
 
     draw = _draw_fn(name, model, ae, patch)
+    block_draw = _block_draw_fn(name, model, ae, patch)
     row = {
         "cell": name, "seed": seed, "geometry": "hyperbolic" if is_helm else "euclidean",
         "objective": "calm" if is_calm else "discrete",
-        "top1": M.top1_accuracy(draw, eval_batches),
+        "top1_teacher_forced": M.top1_accuracy(draw, eval_batches),
         "brier": M.brier_by_order(draw, eval_batches),
+        # The format-neutral comparison: next K tokens from complete blocks,
+        # one AR step for CALM against K for the discrete column.
+        "block": M.block_accuracy(block_draw, eval_batches[:4], patch,
+                                  n_samples=8),
+        "ar_steps_per_block": 1 if name.endswith("calm") else patch,
         "bpb": None,
         "final_loss": statistics.mean(history[-50:]) if history else float("nan"),
         "steps_to_threshold": M.steps_to_threshold(
@@ -182,6 +188,50 @@ def run_cell(name, cfg, args, ae, train_stream, eval_batches, patch, device,
 
 def _unwrap(out):
     return out[0] if isinstance(out, tuple) else out
+
+
+def _block_draw_fn(name, model, ae, patch):
+    """Next-K-tokens from complete blocks only -- no ground truth inside the block.
+
+    The asymmetry this removes: a teacher-forced discrete model is shown the
+    ground-truth tokens CALM never sees. Here both columns get prior complete blocks and
+    nothing else, so the comparison is in the format CALM targets rather than
+    the one it exists to escape.
+    """
+    if name.endswith("calm"):
+        # One latent, decoded to K tokens: a single autoregressive step.
+        base = _draw_fn(name, model, ae, patch)
+
+        def draw(tokens, n):
+            samples, targets = base(tokens, n)
+            # (n, rows, S') -> (n, blocks, K)
+            return (samples.reshape(n, -1, patch), targets.reshape(-1, patch))
+        return draw
+
+    logits_fn = ((lambda t: _unwrap(model(t))) if name.startswith("helm")
+                 else model.logits)
+
+    @torch.no_grad()
+    def draw(tokens, n):
+        """Free-run K steps, feeding back the model's own samples."""
+        n_blocks = tokens.size(1) // patch
+        prefix_len = (n_blocks - 1) * patch
+        context = tokens[:, :prefix_len]
+        targets = tokens[:, patch:n_blocks * patch].reshape(-1, patch)
+        drawn = []
+        for _ in range(n):
+            running = context
+            emitted = []
+            for _ in range(patch):
+                probs = logits_fn(running).float().softmax(-1)[:, -1]
+                nxt = torch.multinomial(probs, 1)
+                emitted.append(nxt)
+                running = torch.cat([running, nxt], dim=1)
+            drawn.append(torch.cat(emitted, dim=1))
+        # (n, batch, K); the block predicted is the one after the prefix
+        samples = torch.stack(drawn)
+        return samples.reshape(n, -1, patch), targets[-samples.shape[1]:]
+    return draw
 
 
 def _draw_fn(name, model, ae, patch):
@@ -317,7 +367,10 @@ def main():
                            options.patch, device, seed, vocab, options.lr)
             rows.append(row)
             bpb = f"{row['bpb']:.4f}" if row["bpb"] is not None else "n/a"
-            print(f"{cell:16s} seed {seed}  top1 {row['top1']:7.2%}  BPB {bpb:>8s}  "
+            print(f"{cell:16s} seed {seed}  tf-top1 {row['top1_teacher_forced']:6.2%}  "
+                  f"block {row['block']['exact_block']:6.2%}  "
+                  f"tok-in-blk {row['block']['token_in_block']:6.2%}  "
+                  f"AR/blk {row['ar_steps_per_block']}  BPB {bpb:>8s}  "
                   f"brier1 {row['brier'][0]:+.5f}  rank {row['effective_rank']:6.1f}  "
                   f"NaN {row['nonfinite_steps']:3d}", flush=True)
 
@@ -330,12 +383,12 @@ def main():
         print(f"\nwrote {options.out}")
 
 
-def mean_of(rows, cell, key="top1"):
+def mean_of(rows, cell, key="top1_teacher_forced"):
     values = [r[key] for r in rows if r["cell"] == cell]
     return statistics.mean(values) if values else float("nan")
 
 
-def spread_of(rows, cell, key="top1"):
+def spread_of(rows, cell, key="top1_teacher_forced"):
     values = [r[key] for r in rows if r["cell"] == cell]
     return statistics.stdev(values) if len(values) > 1 else 0.0
 

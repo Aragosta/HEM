@@ -193,3 +193,59 @@ def efficiency(patch_size: int, seq_len: int, seconds_per_step: float,
             "ar_steps_per_sequence": seq_len / patch_size,
             "seconds_per_token": seconds_per_step / max(tokens_per_step, 1),
             "peak_mb": peak_bytes / (1024 ** 2)}
+
+
+# ----------------------------------------- block prediction, the format CALM targets
+
+@torch.no_grad()
+def block_accuracy(block_draw: Callable, batches: Sequence[torch.Tensor],
+                   patch: int, n_samples: int = 32) -> Dict[str, float]:
+    """Predict the next K tokens from complete blocks only. **The fair comparison.**
+
+    :func:`top1_accuracy` scores token by token with teacher forcing, which is
+    the format CALM exists to escape and is biased against it: at the 2nd, 3rd
+    and 4th token of a patch the discrete model has already been shown ground
+    truth that CALM never sees, because CALM emits all K tokens from a single
+    vector with no intra-patch feedback.
+
+    This removes that asymmetry. Both columns are given prior *complete blocks*
+    and asked for the next K tokens with no ground truth inside the block:
+
+    * a **CALM** model draws one latent and decodes it -- one autoregressive
+      step, which is the whole point;
+    * a **discrete** model free-runs K steps, feeding back its own samples --
+      K autoregressive steps for the same output.
+
+    ``block_draw(tokens, n)`` must return ``(samples, targets)`` with samples
+    ``(n, blocks, K)``.
+
+    Returns exact-block accuracy -- the unit CALM actually predicts -- alongside
+    per-token accuracy within the block, and accuracy by position, which shows
+    whether a model degrades across the block it emitted in one shot.
+    """
+    exact = token_hits = blocks = tokens_seen = 0
+    by_position = torch.zeros(patch, dtype=torch.float64)
+    position_counts = torch.zeros(patch, dtype=torch.float64)
+    for batch in batches:
+        samples, targets = block_draw(batch, n_samples)
+        predicted = torch.mode(samples, dim=0).values      # (blocks, K)
+        hit = predicted == targets
+        exact += hit.all(dim=-1).sum().item()
+        blocks += hit.shape[0]
+        token_hits += hit.sum().item()
+        tokens_seen += hit.numel()
+        by_position += hit.float().sum(0).double().cpu()
+        position_counts += hit.shape[0]
+    return {"exact_block": exact / max(blocks, 1),
+            "token_in_block": token_hits / max(tokens_seen, 1),
+            "by_position": (by_position / position_counts.clamp_min(1)).tolist()}
+
+
+def quality_per_step(quality: float, patch: int) -> float:
+    """Quality divided by autoregressive steps -- CALM's actual claim.
+
+    CALM does not claim to be better per token. It claims a better
+    performance-compute tradeoff: the same output for K times fewer sequential
+    steps. Reporting quality alone answers a question CALM is not asking.
+    """
+    return quality * patch

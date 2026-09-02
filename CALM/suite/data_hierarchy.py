@@ -92,12 +92,57 @@ def cooccurrence_distances(units: Sequence, top: int, window: int
     return distances, vocabulary
 
 
+#: Below this linked fraction the graph is too sparse for delta to mean anything.
+#:
+#: An unlinked pair sits at the constant maximum distance, so a graph that is
+#: mostly unlinked is a near-uniform metric -- and every four-point sum in a
+#: uniform metric is equal, which drives delta to ~0 *regardless of structure*.
+#: The first run of this script reported delta 0.0009 at K=4 with 1.1% linked
+#: and concluded that patches were more tree-like than tokens. They were not;
+#: the graph was empty. Reporting a delta without this gate is how that happens.
+MIN_LINKED = 0.15
+
+
 def measure(units: Sequence, label: str, top: int, window: int, seed: int) -> Dict:
     distances, vocabulary = cooccurrence_distances(units, top, window)
-    delta = delta_hyperbolicity(distances, samples=200000, seed=seed)
-    density = (distances < 0.999).float().mean().item()
+    linked = (distances < 0.999).float().mean().item()
+    valid = linked >= MIN_LINKED
+    delta = (delta_hyperbolicity(distances, samples=200000, seed=seed)
+             if valid else float("nan"))
     return {"label": label, "units": len(units), "vocabulary": len(vocabulary),
-            "delta": delta, "linked_fraction": density}
+            "delta": delta, "linked_fraction": linked, "valid": valid}
+
+
+def patch_profiles(sequence: Sequence[int], k: int, top: int, window: int
+                   ) -> torch.Tensor:
+    """Patches as aggregates of their tokens' co-occurrence profiles.
+
+    Raw K-gram co-occurrence is unusable past K=2: the top 4-grams barely
+    co-occur, the graph empties, and delta becomes vacuous. This is the
+    construction the model actually uses instead -- CALM's patch embedding
+    aggregates the K token representations rather than treating the K-gram as an
+    atom -- so it stays dense while still asking whether the aggregate keeps the
+    structure of its parts.
+
+    Each patch becomes the mean PPMI profile of its tokens; distance is cosine
+    on those profiles.
+    """
+    token_distances, vocabulary = cooccurrence_distances(sequence, top, window)
+    index = {unit: i for i, unit in enumerate(vocabulary)}
+    profiles = 1.0 - token_distances          # similarity, dense by construction
+
+    rows = []
+    for start in range(0, len(sequence) - k + 1, k):
+        members = [index[t] for t in sequence[start:start + k] if t in index]
+        if len(members) == k:                  # only fully in-vocabulary patches
+            rows.append(profiles[members].mean(0))
+        if len(rows) >= top:
+            break
+    if len(rows) < 8:
+        return torch.zeros((0, 0), dtype=torch.float64)
+    matrix = torch.stack(rows)
+    normed = matrix / matrix.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    return (1.0 - normed @ normed.T).clamp_min(0)
 
 
 def main():
@@ -117,11 +162,23 @@ def main():
     print(f"{corpus.name} {options.level}-level, {len(sequence):,} units, "
           f"graph over the {options.units} most frequent, window {options.window}\n")
 
-    rows = [measure(sequence, f"tokens (K=1)", options.units, options.window,
+    rows = [measure(sequence, "tokens (K=1)", options.units, options.window,
                     options.seed)]
     for k in (2, options.patch, 8):
-        rows.append(measure(ngrams(sequence, k), f"patches (K={k})",
+        rows.append(measure(ngrams(sequence, k), f"K-gram atoms (K={k})",
                             options.units, options.window, options.seed))
+
+    # The construction the model uses: patches as aggregates of their tokens.
+    for k in (1, 2, options.patch, 8):
+        distances = patch_profiles(sequence, k, options.units, options.window)
+        if distances.numel() == 0:
+            continue
+        linked = (distances < 0.999).float().mean().item()
+        rows.append({"label": f"aggregated profiles (K={k})",
+                     "units": len(sequence), "vocabulary": distances.shape[0],
+                     "linked_fraction": linked, "valid": True,
+                     "delta": delta_hyperbolicity(distances, samples=200000,
+                                                  seed=options.seed)})
 
     generator = torch.Generator().manual_seed(options.seed)
     shuffled = torch.tensor(sequence)[torch.randperm(len(sequence),
@@ -129,14 +186,25 @@ def main():
     rows.append(measure(shuffled, "tokens, order shuffled", options.units,
                         options.window, options.seed))
 
-    print(f"{'construction':>26s} {'delta':>8s} {'linked':>8s} {'vocab':>7s}")
+    print(f"{'construction':>28s} {'delta':>9s} {'linked':>8s} {'vocab':>7s}")
     for row in rows:
-        print(f"{row['label']:>26s} {row['delta']:8.4f} "
+        delta = ("  vacuous" if not row["valid"] else f"{row['delta']:9.4f}")
+        print(f"{row['label']:>28s} {delta:>9s} "
               f"{row['linked_fraction']:8.1%} {row['vocabulary']:7d}")
+    print(f"\n'vacuous' = under {MIN_LINKED:.0%} of pairs linked. An unlinked "
+          f"pair sits at the constant\nmaximum distance, so a mostly-unlinked "
+          f"graph is a near-uniform metric, where every\nfour-point sum is "
+          f"equal and delta collapses to ~0 regardless of structure.")
 
-    token_delta = rows[0]["delta"]
-    patch_delta = next(r["delta"] for r in rows
-                       if r["label"] == f"patches (K={options.patch})")
+    token_delta = next((r["delta"] for r in rows
+                        if r["label"] == "aggregated profiles (K=1)"), rows[0]["delta"])
+    patch_delta = next((r["delta"] for r in rows
+                        if r["label"] == f"aggregated profiles (K={options.patch})"),
+                       float("nan"))
+    if math.isnan(token_delta) or math.isnan(patch_delta):
+        print("\nNo valid comparison: the constructions needed for it were "
+              "vacuous. No verdict.")
+        return
     shuffled_delta = rows[-1]["delta"]
     print(f"\nlower delta = more tree-like. Read against the shuffled control "
           f"({shuffled_delta:.4f}):\nany construction yields some delta, so only "
