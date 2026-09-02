@@ -316,10 +316,21 @@ def main():
         print(f"{name:32s} {bpb:>10s} {bpb_train:>10s} {orders} "
               f"{row['brierlm']:9.4f} {ceiling:>9s}")
     print("\nBPB is n/a for HELM-CALM by construction: an implicit sampler has "
-          "no density.\nA uniform byte model scores BPB 8.0000 and brier_1 "
-          "about 1/256 = 0.0039.\nRead the per-order columns, not BrierLM: one "
-          "zero factor collapses the geometric mean\nto 0.0000 for every arm "
-          "alike (see score_brierlm).")
+          "no density.\nA uniform byte model scores BPB 8.0000 and brier_n "
+          "about 1/256 = 0.0039.\n"
+          "\nRead the per-order columns, not BrierLM: one zero factor collapses "
+          "the geometric\nmean to 0.0000 for every arm alike (see "
+          "score_brierlm). Reading brier_n:\n"
+          "  ~0    diffuse and wrong -- draws neither match the target nor each "
+          "other\n"
+          "  < 0   mode collapse -- the two independent draws agree with each "
+          "other but not\n"
+          "        with the target; -1 is total collapse, which is what the "
+          "collision term\n"
+          "        exists to punish\n"
+          "  > 0   real signal; this is the only region where a comparison "
+          "between arms means\n"
+          "        anything")
 
 
 if __name__ == "__main__":
