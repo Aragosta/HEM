@@ -58,7 +58,7 @@ ROOT = Path(__file__).resolve().parents[2]
 for _extra in (ROOT, ROOT / "CALM", ROOT / "CALM" / "experiments"):
     sys.path.insert(0, str(_extra))
 
-from brierlm import brier_lm  # noqa: E402
+from brierlm import brier_lm, brier_scores  # noqa: E402
 from helm_calm import HelmCALM, PatchAutoencoder  # noqa: E402
 from helm.hypercore.manifolds import Lorentz  # noqa: E402
 from helm.modules.helm_mice import HelmMiCE  # noqa: E402
@@ -220,13 +220,27 @@ def train_calm(args, autoencoder, train_batches, steps, lr):
 
 # ------------------------------------------------------------------ scoring
 
-def score_brierlm(sampler, batches, max_n=4) -> float:
-    """``sampler`` returns two independent draws and the targets, sequence-shaped."""
-    values = []
+def score_brierlm(sampler, batches, max_n=4):
+    """``sampler`` returns two independent draws and the targets, sequence-shaped.
+
+    Returns ``(per_order, brierlm)``.
+
+    **Why the per-order scores are reported and not just the aggregate.**
+    BrierLM is a geometric mean over orders 1..4, so a single zero factor sends
+    it to exactly zero. At byte level two independent draws agree on a 4-gram
+    with probability around 256^-4 unless the model is genuinely strong, so
+    ``brier_4`` pins to 0 and the aggregate reads 0.0000 for *every* arm --
+    identical output for a good model and a random one. The aggregate is still
+    printed, because it is what CALM reports, but it is not the comparison; the
+    per-order scores are.
+    """
+    totals = torch.zeros(max_n, dtype=torch.float64)
+    aggregate = 0.0
     for tokens in batches:
         first, second, targets = sampler(tokens)
-        values.append(brier_lm(first, second, targets, max_n=max_n))
-    return sum(values) / len(values)
+        totals += brier_scores(first, second, targets, max_n).double()
+        aggregate += brier_lm(first, second, targets, max_n=max_n)
+    return (totals / len(batches)).tolist(), aggregate / len(batches)
 
 
 def main():
@@ -260,9 +274,10 @@ def main():
         results["discrete HELM"] = {
             "bpb": bits_per_byte(model, valid_batches),
             "bpb_train": bits_per_byte(model, train_batches[:16]),
-            "brierlm": score_brierlm(
-                lambda t: discrete_samples(model, t), valid_batches),
         }
+        orders, aggregate = score_brierlm(
+            lambda t: discrete_samples(model, t), valid_batches)
+        results["discrete HELM"].update(brier_orders=orders, brierlm=aggregate)
 
     for name, cls in (("euclidean", PatchAutoencoder),
                       ("hyperbolic", LorentzPatchAutoencoder)):
@@ -281,23 +296,30 @@ def main():
             reshape = lambda t: t.reshape(rows, -1)  # noqa: E731
             return (reshape(samples[0]), reshape(samples[1]), reshape(targets))
 
+        orders, aggregate = score_brierlm(sampler, valid_batches)
         results[f"HELM-CALM ({name} latent)"] = {
             "bpb": None,
             "ae_ceiling": autoencoder_ceiling(autoencoder, valid_data),
-            "brierlm": score_brierlm(sampler, valid_batches),
+            "brier_orders": orders,
+            "brierlm": aggregate,
         }
 
-    print(f"{'model':32s} {'BPB (valid)':>12s} {'BPB (train)':>12s} "
-          f"{'BrierLM':>9s} {'AE ceiling':>11s}")
+    print(f"{'model':32s} {'BPB valid':>10s} {'BPB train':>10s} "
+          f"{'brier_1':>9s} {'brier_2':>9s} {'brier_3':>9s} {'brier_4':>9s} "
+          f"{'BrierLM':>9s} {'AE ceil':>9s}")
     for name, row in results.items():
         bpb = f"{row['bpb']:.4f}" if row.get("bpb") is not None else "n/a"
         bpb_train = (f"{row['bpb_train']:.4f}" if row.get("bpb_train") is not None
                      else "n/a")
         ceiling = (f"{row['ae_ceiling']:.2%}" if "ae_ceiling" in row else "n/a")
-        print(f"{name:32s} {bpb:>12s} {bpb_train:>12s} "
-              f"{row['brierlm']:9.4f} {ceiling:>11s}")
+        orders = " ".join(f"{v:9.5f}" for v in row["brier_orders"])
+        print(f"{name:32s} {bpb:>10s} {bpb_train:>10s} {orders} "
+              f"{row['brierlm']:9.4f} {ceiling:>9s}")
     print("\nBPB is n/a for HELM-CALM by construction: an implicit sampler has "
-          "no density.\nA uniform byte model scores BPB 8.0000.")
+          "no density.\nA uniform byte model scores BPB 8.0000 and brier_1 "
+          "about 1/256 = 0.0039.\nRead the per-order columns, not BrierLM: one "
+          "zero factor collapses the geometric mean\nto 0.0000 for every arm "
+          "alike (see score_brierlm).")
 
 
 if __name__ == "__main__":
