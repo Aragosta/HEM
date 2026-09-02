@@ -148,6 +148,28 @@ def batches_from(data: torch.Tensor, batch_size: int, seq_len: int, count: int,
     return out
 
 
+def stream_from(data: torch.Tensor, batch_size: int, seq_len: int, seed: int):
+    """Deterministic unbounded batch stream over the whole split.
+
+    :func:`batches_from` materialises a fixed list, which is fine for evaluation
+    but wrong for training: with 64 batches of 8x128 a run sees 65,536 distinct
+    tokens and cycles them, which is 0.6% of WikiText-2 and puts the model back
+    in the memorisation regime that a real corpus was fetched to escape.
+
+    Seeded identically per cell, so every arm of the 2x2 still sees exactly the
+    same data in the same order -- the property the design needs -- while
+    drawing from the entire split.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    highest = data.numel() - seq_len - 1
+    if highest <= 0:
+        raise ValueError(f"split of {data.numel()} units is shorter than "
+                         f"seq_len {seq_len}")
+    while True:
+        starts = torch.randint(0, highest, (batch_size,), generator=generator)
+        yield torch.stack([data[s:s + seq_len] for s in starts])
+
+
 def overlap_report(corpus: Corpus, n: int = 16, samples: int = 20000,
                    seed: int = 0) -> Dict[str, float]:
     """How much of the validation split appears verbatim in train.

@@ -55,18 +55,18 @@ from helm_calm import PatchAutoencoder  # noqa: E402
 from models import (CELLS, EuclideanCalm, EuclideanDiscrete,  # noqa: E402
                     build_helm_calm, build_helm_discrete, count_parameters,
                     describe, match_euclidean_width)
-from corpus import batches_from, load, overlap_report  # noqa: E402
+from corpus import batches_from, load, overlap_report, stream_from  # noqa: E402
 from tests._config import tiny_args  # noqa: E402
 
 TIERS = {
     0: dict(steps=30, ae_steps=50, seq_len=64, batch=4, dim=33, layers=2,
-            heads=3, latent=16, train_batches=8, eval_batches=4),
+            heads=3, latent=16, train_batches=0, eval_batches=4),
     1: dict(steps=4000, ae_steps=3000, seq_len=128, batch=8, dim=65, layers=4,
-            heads=5, latent=64, train_batches=64, eval_batches=16),
+            heads=5, latent=64, train_batches=0, eval_batches=16),
     2: dict(steps=20000, ae_steps=8000, seq_len=512, batch=16, dim=513,
-            layers=12, heads=8, latent=128, train_batches=512, eval_batches=64),
+            layers=12, heads=8, latent=128, train_batches=0, eval_batches=64),
     3: dict(steps=100000, ae_steps=20000, seq_len=2048, batch=32, dim=1025,
-            layers=24, heads=16, latent=128, train_batches=4096,
+            layers=24, heads=16, latent=128, train_batches=0,
             eval_batches=256),
 }
 
@@ -113,7 +113,7 @@ def autoencoder_ceiling(ae, data, patch, device):
     return hit.all(dim=-1).float().mean().item()
 
 
-def run_cell(name, cfg, args, ae, train_batches, eval_batches, patch, device,
+def run_cell(name, cfg, args, ae, train_stream, eval_batches, patch, device,
              seed, vocab, lr=1e-3):
     """Train one cell and collect everything the design asks of it."""
     torch.manual_seed(seed)
@@ -143,7 +143,7 @@ def run_cell(name, cfg, args, ae, train_batches, eval_batches, patch, device,
     history, grad_norms, nonfinite = [], [], 0
     started = time.time()
     for step in range(cfg["steps"]):
-        loss = step_loss(train_batches[step % len(train_batches)])
+        loss = step_loss(next(train_stream).to(device))
         if not torch.isfinite(loss):
             nonfinite += 1
             optimizer.zero_grad()
@@ -268,12 +268,14 @@ def main():
     corpus = load(options.corpus, options.level, options.limit or None)
     vocab = corpus.vocab_size
     train, valid = corpus.train, corpus.valid
-    train_batches = [b.to(device) for b in batches_from(
-        train, cfg["batch"], cfg["seq_len"], cfg["train_batches"], seed=0)]
     eval_batches = [b.to(device) for b in batches_from(
         valid, cfg["batch"], cfg["seq_len"], cfg["eval_batches"], seed=1)]
 
     args = helm_args(cfg, vocab)
+    def make_stream():
+        """A fresh, identically-seeded stream per cell over the whole split."""
+        return stream_from(train, cfg["batch"], cfg["seq_len"], seed=0)
+
     ae = train_autoencoder(train, cfg, options.patch, device, vocab)
     ceiling = autoencoder_ceiling(ae, valid, options.patch, device)
 
@@ -286,6 +288,9 @@ def main():
     budget = describe(build_helm_discrete(args), args, cfg["seq_len"], is_helm=True)
 
     base = M.lookup_baselines(train, [b.cpu() for b in eval_batches], vocab)
+    seen = cfg["steps"] * cfg["batch"] * cfg["seq_len"]
+    print(f"  training stream: {seen:,} tokens over {cfg['steps']:,} steps "
+          f"= {seen / train.numel():.2f} epochs of the split")
     print(f"tier {options.tier}  K={options.patch}  seeds {seeds}  device {device}")
     print(corpus.describe())
     print(f"  digests {corpus.digests}")
@@ -304,7 +309,7 @@ def main():
     rows: List[Dict] = []
     for cell in cells:
         for seed in seeds:
-            row = run_cell(cell, cfg, args, ae, train_batches, eval_batches,
+            row = run_cell(cell, cfg, args, ae, make_stream(), eval_batches,
                            options.patch, device, seed, vocab, options.lr)
             rows.append(row)
             bpb = f"{row['bpb']:.4f}" if row["bpb"] is not None else "n/a"
