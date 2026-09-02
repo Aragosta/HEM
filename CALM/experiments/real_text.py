@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Real English text, real patches, and the metrics a language-model paper reports.
+
+``EVALUATION.md`` sets out why nothing else in ``experiments/`` counts as a
+language-modelling result: a synthetic tree grammar, 1024 tokens, ``K = 1``, and
+until recently no held-out split. This script fixes as much of that as this
+environment allows.
+
+**Corpus.** The repository's own English prose and source -- every ``.md`` and
+``.py`` outside ``upstream/`` -- read as **bytes**, vocabulary 256. Byte level is
+not a compromise here: it removes the tokenizer from the comparison entirely,
+which is why bits-per-byte is the tokenizer-independent metric labs report when
+models do not share a vocabulary. The split is **by file**, not by slicing inside
+a document, so no validation context has its own neighbourhood in the training
+set.
+
+The honest limitation: this is ~900 KB, which is four to six orders of magnitude
+below a real pretraining corpus, and HuggingFace is unreachable from this
+environment (the egress proxy rejects it) so WikiText-103 and the Llama-3
+tokenizer cannot be fetched. What this buys over the tree grammar is real
+Zipfian statistics, real long-range structure, and a genuine train/validation
+separation. What it does not buy is scale.
+
+**Metrics.**
+
+``bits_per_byte``
+    ``-log2 p(byte)`` averaged over held-out bytes. The standard, and the one
+    number here directly comparable to published work in kind (not in value,
+    at this scale). Available for the **discrete** model only: HELM-CALM's head
+    is an implicit sampler with no density, which is a property of CALM's design,
+    not a gap in this port.
+
+``BrierLM``
+    CALM's likelihood-free proper score, from ``brierlm.py``. Computable for
+    both model families, and therefore the only metric on which they can be
+    compared at all.
+
+``K = 4`` throughout, so the patching that is CALM's entire reason to exist is
+actually exercised.
+
+Usage::
+
+    python CALM/experiments/real_text.py --steps 3000
+    python CALM/experiments/real_text.py --steps 3000 --arms discrete,euclidean
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+from pathlib import Path
+from typing import List, Tuple
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[2]
+for _extra in (ROOT, ROOT / "CALM", ROOT / "CALM" / "experiments"):
+    sys.path.insert(0, str(_extra))
+
+from brierlm import brier_lm  # noqa: E402
+from helm_calm import HelmCALM, PatchAutoencoder  # noqa: E402
+from helm.hypercore.manifolds import Lorentz  # noqa: E402
+from helm.modules.helm_mice import HelmMiCE  # noqa: E402
+from hyperbolic_latent import LorentzPatchAutoencoder  # noqa: E402
+from tests._config import tiny_args  # noqa: E402
+
+VOCAB = 256
+
+
+# ------------------------------------------------------------------- corpus
+
+def collect_files() -> List[Path]:
+    """Every ``.md`` and ``.py`` in the repo that is our own writing."""
+    files = []
+    for pattern in ("*.md", "*.py"):
+        for path in sorted(ROOT.rglob(pattern)):
+            parts = set(path.parts)
+            if parts & {".git", "upstream", "__pycache__", "node_modules"}:
+                continue
+            files.append(path)
+    return files
+
+
+def build_corpus(valid_fraction: float = 0.1) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Byte tensors for train and validation, split by whole file.
+
+    Splitting by file rather than by offset is the point: adjacent slices of one
+    document share vocabulary, topic and often literal substrings, so an
+    offset split leaks and flatters the validation number.
+    """
+    files = collect_files()
+    # Deterministic, and interleaved so both halves see every directory rather
+    # than the validation set being whatever sorts last.
+    stride = max(int(1 / valid_fraction), 2)
+    train_bytes, valid_bytes = bytearray(), bytearray()
+    for index, path in enumerate(files):
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        (valid_bytes if index % stride == 0 else train_bytes).extend(raw)
+    return (torch.frombuffer(bytes(train_bytes), dtype=torch.uint8).long(),
+            torch.frombuffer(bytes(valid_bytes), dtype=torch.uint8).long())
+
+
+def batches_from(data: torch.Tensor, batch_size: int, seq_len: int, count: int,
+                 seed: int) -> List[torch.Tensor]:
+    """Fixed set of random windows, so every arm sees identical data."""
+    generator = torch.Generator().manual_seed(seed)
+    highest = data.numel() - seq_len - 1
+    out = []
+    for _ in range(count):
+        starts = torch.randint(0, highest, (batch_size,), generator=generator)
+        out.append(torch.stack([data[s:s + seq_len] for s in starts]))
+    return out
+
+
+# --------------------------------------------------------------------- arms
+
+def model_args(seq_len: int) -> object:
+    return tiny_args(vocab_size=VOCAB, dim=65, n_layers=4, n_heads=5,
+                     max_seq_len=seq_len, original_seq_len=seq_len,
+                     max_batch_size=8, qk_nope_head_dim=13, qk_rope_head_dim=13,
+                     v_head_dim=13, kv_lora_rank=33, inter_dim=128,
+                     moe_inter_dim=96, mice_inter_dim=96)
+
+
+def train_discrete(args, train_batches, steps, lr):
+    """Optimized HELM-MiCE with its ordinary vocabulary head."""
+    torch.manual_seed(0)
+    model = HelmMiCE(args, Lorentz(1.0), Lorentz(1.0), Lorentz(1.0))
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=lr)
+    model.train()
+    for step in range(steps):
+        tokens = train_batches[step % len(train_batches)]
+        out = model(tokens[:, :-1], labels=tokens[:, 1:])
+        loss = out[0] if isinstance(out, tuple) else out
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        optimizer.step()
+    return model.eval()
+
+
+@torch.no_grad()
+def bits_per_byte(model, batches) -> float:
+    """Held-out ``-log2 p(byte)``. The metric, for the model that has a density."""
+    total_nats, total_bytes = 0.0, 0
+    for tokens in batches:
+        out = model(tokens[:, :-1], labels=tokens[:, 1:])
+        loss = out[0] if isinstance(out, tuple) else out
+        count = tokens[:, 1:].numel()
+        total_nats += loss.item() * count
+        total_bytes += count
+    return total_nats / total_bytes / math.log(2)
+
+
+@torch.no_grad()
+def discrete_samples(model, tokens):
+    """Two independent teacher-forced draws, ``(B, S-1)`` each, plus targets.
+
+    BrierLM scores n-grams up to order 4, so the sequence axis has to survive:
+    flattening to a single vector would make every "n-gram" a splice across
+    unrelated positions.
+    """
+    out = model(tokens[:, :-1])
+    logits = (out[0] if isinstance(out, tuple) else out).float()
+    probs = logits.softmax(-1)
+    flat = probs.reshape(-1, probs.size(-1))
+    first = torch.multinomial(flat, 1).reshape(probs.shape[:-1])
+    second = torch.multinomial(flat, 1).reshape(probs.shape[:-1])
+    return first, second, tokens[:, 1:]
+
+
+def train_autoencoder(cls, train_data, patch, latent, steps, seed=0):
+    torch.manual_seed(seed)
+    autoencoder = cls(VOCAB, hidden=128, latent_size=latent, patch_size=patch)
+    optimizer = torch.optim.AdamW(autoencoder.parameters(), lr=3e-3)
+    generator = torch.Generator().manual_seed(seed)
+    usable = (train_data.numel() // patch) * patch
+    patches = train_data[:usable].view(-1, patch)
+    for _ in range(steps):
+        rows = torch.randint(0, patches.size(0), (128,), generator=generator)
+        loss, _ = autoencoder.elbo(patches[rows])
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    return autoencoder.freeze()
+
+
+@torch.no_grad()
+def autoencoder_ceiling(autoencoder, data) -> float:
+    patch = autoencoder.patch_size
+    usable = (data.numel() // patch) * patch
+    patches = data[:usable].view(-1, patch)[:4096]
+    posterior = autoencoder.encode(patches)
+    latent = (posterior.mean if getattr(autoencoder, "is_hyperbolic", False)
+              else posterior[0])
+    return (autoencoder.decode(latent).argmax(-1) == patches).float().mean().item()
+
+
+def train_calm(args, autoencoder, train_batches, steps, lr):
+    torch.manual_seed(0)
+    model = HelmCALM(args, autoencoder, num_samples=8, head_kind="lorentz")
+    groups = model.parameter_groups()
+    params = groups["euclidean"] + groups["manifold"]
+    optimizer = torch.optim.AdamW(params, lr=lr)
+    model.train()
+    for step in range(steps):
+        loss = model.loss(train_batches[step % len(train_batches)])
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        optimizer.step()
+        model.retract_manifold_parameters()
+    return model.eval()
+
+
+# ------------------------------------------------------------------ scoring
+
+def score_brierlm(sampler, batches, max_n=4) -> float:
+    """``sampler`` returns two independent draws and the targets, sequence-shaped."""
+    values = []
+    for tokens in batches:
+        first, second, targets = sampler(tokens)
+        values.append(brier_lm(first, second, targets, max_n=max_n))
+    return sum(values) / len(values)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--steps", type=int, default=3000)
+    parser.add_argument("--ae-steps", type=int, default=1500)
+    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--patch", type=int, default=4)
+    parser.add_argument("--latent", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--arms", default="discrete,euclidean,hyperbolic")
+    args_cli = parser.parse_args()
+    arms = set(args_cli.arms.split(","))
+
+    train_data, valid_data = build_corpus()
+    print(f"corpus: {train_data.numel():,} train bytes, "
+          f"{valid_data.numel():,} validation bytes, split by file")
+    print(f"K = {args_cli.patch}, seq_len = {args_cli.seq_len}, "
+          f"{args_cli.steps} steps\n")
+
+    train_batches = batches_from(train_data, args_cli.batch_size,
+                                 args_cli.seq_len, 64, seed=0)
+    valid_batches = batches_from(valid_data, args_cli.batch_size,
+                                 args_cli.seq_len, 16, seed=1)
+    args = model_args(args_cli.seq_len)
+    results = {}
+
+    if "discrete" in arms:
+        model = train_discrete(args, train_batches, args_cli.steps, args_cli.lr)
+        results["discrete HELM"] = {
+            "bpb": bits_per_byte(model, valid_batches),
+            "bpb_train": bits_per_byte(model, train_batches[:16]),
+            "brierlm": score_brierlm(
+                lambda t: discrete_samples(model, t), valid_batches),
+        }
+
+    for name, cls in (("euclidean", PatchAutoencoder),
+                      ("hyperbolic", LorentzPatchAutoencoder)):
+        if name not in arms:
+            continue
+        autoencoder = train_autoencoder(cls, train_data, args_cli.patch,
+                                        args_cli.latent, args_cli.ae_steps)
+        model = train_calm(args, autoencoder, train_batches, args_cli.steps,
+                           args_cli.lr)
+
+        def sampler(tokens, model=model, patch=args_cli.patch):
+            # sample_tokens flattens (batch, patch) into one position axis;
+            # folding it back recovers the byte sequence BrierLM needs.
+            samples, targets = model.sample_tokens(tokens, n_samples=2)
+            rows = tokens.size(0)
+            reshape = lambda t: t.reshape(rows, -1)  # noqa: E731
+            return (reshape(samples[0]), reshape(samples[1]), reshape(targets))
+
+        results[f"HELM-CALM ({name} latent)"] = {
+            "bpb": None,
+            "ae_ceiling": autoencoder_ceiling(autoencoder, valid_data),
+            "brierlm": score_brierlm(sampler, valid_batches),
+        }
+
+    print(f"{'model':32s} {'BPB (valid)':>12s} {'BPB (train)':>12s} "
+          f"{'BrierLM':>9s} {'AE ceiling':>11s}")
+    for name, row in results.items():
+        bpb = f"{row['bpb']:.4f}" if row.get("bpb") is not None else "n/a"
+        bpb_train = (f"{row['bpb_train']:.4f}" if row.get("bpb_train") is not None
+                     else "n/a")
+        ceiling = (f"{row['ae_ceiling']:.2%}" if "ae_ceiling" in row else "n/a")
+        print(f"{name:32s} {bpb:>12s} {bpb_train:>12s} "
+              f"{row['brierlm']:9.4f} {ceiling:>11s}")
+    print("\nBPB is n/a for HELM-CALM by construction: an implicit sampler has "
+          "no density.\nA uniform byte model scores BPB 8.0000.")
+
+
+if __name__ == "__main__":
+    main()
