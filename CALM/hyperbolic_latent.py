@@ -199,10 +199,12 @@ class WrappedNormal:
         radius = tangent.norm(dim=-1, keepdim=True).clamp_min(_EPS)
         return tangent * (radius.clamp(max=max_radius) / radius)
 
-    def __init__(self, manifold: Lorentz, mean: torch.Tensor, log_std: torch.Tensor):
+    def __init__(self, manifold: Lorentz, mean: torch.Tensor, log_std: torch.Tensor,
+                 max_radius: float = MAX_TANGENT_RADIUS):
         if mean.shape[-1] != log_std.shape[-1] + 1:
             raise ValueError(f"mean has {mean.shape[-1]} coordinates, so log_std "
                              f"should have {mean.shape[-1] - 1}, got {log_std.shape[-1]}")
+        self.max_radius = max_radius
         self.manifold = manifold
         self.mean = mean
         self.log_std = log_std
@@ -217,6 +219,14 @@ class WrappedNormal:
         shape = self.mean.shape if n is None else (n, *self.mean.shape)
         v = torch.randn((*shape[:-1], self.dim), dtype=self.mean.dtype,
                         device=self.mean.device) * self.log_std.exp()
+        # The *sample* needs the radius budget as much as the mean does, and it
+        # is the easier one to overlook: clamping only the mean leaves the
+        # posterior centred inside float32 while every draw from it lands
+        # outside. Measured with the mean clamped at 5 and the sample
+        # unclamped, log_std reached 1.96 and the sampled tangent radius
+        # reached 22 -- far past the radius-8 cliff -- which is what made the
+        # wrapped-normal autoencoder reconstruct at 0.00%.
+        v = self.clamp_tangent(v, self.max_radius)
         mean = self.mean if n is None else self.mean.expand(shape)
         u = self.manifold.transp0(mean, self._lift(v))
         return self.manifold.expmap(mean, u), v
@@ -344,7 +354,8 @@ class LorentzPatchAutoencoder(nn.Module):
         mean = self.manifold.expmap0(
             torch.cat([torch.zeros_like(tangent[..., :1]), tangent], dim=-1))
         return WrappedNormal(self.manifold, mean,
-                             self.to_log_std(h).clamp(-6.0, 2.0))
+                             self.to_log_std(h).clamp(-6.0, 2.0),
+                             max_radius=self.max_radius)
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """``(..., L + 1)`` manifold points -> ``(..., K, vocab)``."""

@@ -252,9 +252,16 @@ def test_autoencoder_reconstructs(autoencoder):
 
 
 def test_autoencoder_latent_is_on_the_manifold(autoencoder):
+    """Tolerance is set by the radius budget, not by wishful thinking.
+
+    At radius 5 the constraint residual in float32 is around 1e-3 (see
+    MAX_TANGENT_RADIUS), so demanding 1e-5 asks for precision the representation
+    does not have. What matters is that the residual stays at the level the
+    radius implies rather than growing without bound.
+    """
     model, ids, _ = autoencoder
     with torch.no_grad():
-        assert on_manifold(model.encode(ids).sample(4)) < 1e-5
+        assert on_manifold(model.encode(ids).sample(4)) < 5e-3
 
 
 def test_model_rejects_a_euclidean_head_with_a_curved_latent(autoencoder):
