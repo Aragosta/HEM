@@ -84,3 +84,79 @@ just more compute:
 Until then the honest statement is: *at 450K parameters on byte-level
 WikiText-2, HELM and a matched Euclidean transformer are indistinguishable in
 quality, HELM is 2.8× slower, and HELM's representation is 5× more compact.*
+
+
+## Data hierarchy — is there a patch hierarchy for CALM to have?
+
+HELM's premise is about **token** hierarchy. CALM predicts patches, so the
+premise only carries over if patches inherit the structure. Every earlier
+attempt in this repository to answer that ran through a trained model, where the
+answer is confounded with capacity, optimisation and our own bugs. This asks the
+corpus directly: co-occurrence graph, positive PMI, Gromov's delta -- the
+standard justification for hyperbolic embeddings.
+
+WikiText-2, word level, 2M words, graph over the 400 most frequent units.
+
+| construction | delta | linked |
+| --- | --- | --- |
+| tokens (K=1) | **0.1954** | 82.8% |
+| tokens, word order shuffled | **0.1275** | 92.9% |
+| K-gram atoms (K=2) | 0.1840 | 44.3% |
+| K-gram atoms (K=4) | *vacuous* | **1.1%** |
+| K-gram atoms (K=8) | *vacuous* | 0.7% |
+| aggregated profiles (K=1) | 0.0022 | 100% |
+| aggregated profiles (K=2) | 0.0037 | 100% |
+| aggregated profiles (K=2, scrambled) | 0.0028 | 100% |
+| aggregated profiles (K=4) | 0.0084 | 100% |
+| aggregated profiles (K=4, scrambled) | **0.0072** | 100% |
+| aggregated profiles (K=8) | 0.0099 | 100% |
+| aggregated profiles (K=8, scrambled) | **0.0121** | 100% |
+
+### Two established results
+
+**Token-level hierarchy is real.** delta 0.1954 against 0.1275 for the same
+construction on shuffled word order. HELM's core premise holds on this corpus,
+confirmed without a model in the loop -- the first independent check of it here.
+
+**Patches are not atoms.** Raw K-gram co-occurrence is unusable past K=2: at K=4
+only 1.1% of pairs are linked, because the 400 most frequent 4-grams essentially
+never co-occur. Whatever "patch hierarchy" could mean, it cannot mean patches
+having tree-like relationships among themselves *as units*. It would have to come
+from aggregating token structure -- an argument for CALM's `embed_proj` design
+and against any patch-vocabulary alternative.
+
+### One negative result, from a control that killed a finding
+
+The aggregate construction produced a clean monotone series -- delta 0.0022,
+0.0037, 0.0084, 0.0099 for K = 1, 2, 4, 8 at 100% linked -- which reads as
+"patches are 3.9x less tree-like than their tokens" and would have been the
+`HIERARCHY.md` worry confirmed.
+
+**It is an artefact.** Building patches from K *randomly sampled* tokens instead
+of K consecutive ones -- identical averaging, adjacency destroyed -- reproduces
+the same growth, and at K=8 exceeds it. Averaging vectors concentrates them
+toward the centroid regardless of what they are, and a monotone trend in K is
+exactly what that looks like.
+
+So **there is no evidence here that patching flattens hierarchy.** The
+real-versus-scrambled gaps are around 15% and flip sign across K: noise at one
+seed. This construction cannot detect a patch-hierarchy effect, because the
+averaging artefact swamps whatever signal exists.
+
+### What remains open
+
+The live hypothesis is the one the data cannot reach: that hierarchy lives in a
+hyperbolic backbone's **hidden states** over patches, even when neither the raw
+statistics nor CALM's Gaussian-regularised latent are tree-like. That needs a
+trained model with delta measured on activations -- `probes.hierarchy_flattening`
+-- and it needs a geometry effect to exist in the first place, which the
+reproduction gate says it does not at 450K parameters on bytes.
+
+### Method note
+
+Three constructions in this table were nearly reported as findings before a
+check invalidated them: the K=4 K-gram delta (empty graph), the aggregate
+K-trend (averaging artefact), and, in the suite generally, BrierLM's geometric
+mean (reads 0.0000 for every model at byte level). In each case the invalidating
+quantity was already in the output. `MIN_LINKED`, the scrambled control and the
+per-order Brier reporting exist because of those, not in anticipation of them.
