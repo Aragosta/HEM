@@ -400,18 +400,50 @@ class HelmCALM(nn.Module):
 
     #: How the backbone's on-manifold hidden state is handed to the head.
     #:
-    #: ``"direct"`` passes the Lorentz vector straight into CALM's Euclidean MLP,
-    #: which is what HELM's own vocabulary head does to the same tensor. But
-    #: CALM's head is not a single linear -- it opens with ``nn.LayerNorm`` over
-    #: all ``dim`` coordinates, and the Lorentz time coordinate is structurally
-    #: ``>= sqrt(c)`` and never negative (measured mean 2.46 against space-part
-    #: mean 0.00). LayerNorm therefore subtracts a mean dominated by a coordinate
-    #: that is not a feature, and the result leaves the manifold entirely
-    #: (``<x,x>_L`` drifts from -1.0 to -1.99).
+    #: The hidden state reaches this point through **HELM's own exit map** --
+    #: ``final_proj(h, return_space=True)`` then ``LorentzRMSNorm(space_only=True)``
+    #: -- which is a learned Lorentz linear, not a slice. Whatever follows must
+    #: be applied on top of that, never in place of it.
     #:
-    #: ``"space"`` drops the time coordinate; ``"logmap0"`` maps the point into
-    #: the tangent space at the origin, which is the principled Riemannian way to
-    #: hand a manifold point to a Euclidean network.
+    #: HELM's own vocabulary head then consumes **all** ``dim`` coordinates,
+    #: time included, through a plain ``nn.Linear``. That works because of a
+    #: property measured on the real activations: after ``LorentzRMSNorm`` the
+    #: space part has fixed norm, so
+    #:
+    #:     time coordinate : mean 8.0623, **std 0.0000**, min 8.0623
+    #:     space coordinates: mean -0.1037, std 0.9946
+    #:
+    #: The time coordinate is **constant**. It carries no information at all, and
+    #: a constant fed to a linear layer is just an extra bias term -- which is
+    #: presumably why HELM's head can afford ``bias=False``.
+    #:
+    #: CALM's head opens with ``nn.LayerNorm`` instead, and there the same
+    #: constant is destructive: it is 368x the mean of the whole vector, so
+    #: LayerNorm subtracts a mean dominated by a coordinate that is not a
+    #: feature. Measured, the manifold constraint goes from ~0 to **0.836**.
+    #:
+    #: So the two heads need different treatment of the same tensor, and the
+    #: rule follows from the statistics rather than from taste:
+    #:
+    #: ``"direct"``  passes all ``dim`` coordinates. Correct for a Linear head
+    #:               (HELM's own, and the Lorentz head, which is built from
+    #:               Lorentz layers that expect the time coordinate). Wrong for
+    #:               a LayerNorm head.
+    #: ``"space"``   drops the time coordinate. **Loses nothing** -- its standard
+    #:               deviation is exactly zero -- and is what CALM's Euclidean
+    #:               head should receive.
+    #: ``"logmap0"`` maps into the tangent space at the origin. Its time
+    #:               component is identically zero, so LayerNorm sees a constant
+    #:               that contributes nothing; the space part is rescaled by
+    #:               hyperbolic radius (std 0.3415 against 0.9946 for "space").
+    #:               The principled Riemannian choice, and the one the
+    #:               hyperbolic-network literature names as legitimate at an
+    #:               output boundary.
+    #:
+    #: An earlier comparison had ``logmap0`` losing to ``space`` (91.13% against
+    #: 94.71%). That was measured on the tree language, whose control is now
+    #: known to fail to generalise, with the under-depth patch embedding and the
+    #: previous head. It is not evidence in either direction.
     INPUT_MAPS = ("direct", "space", "logmap0")
 
     #: ``"euclidean"`` is CALM's head verbatim; ``"lorentz"`` rebuilds it from
