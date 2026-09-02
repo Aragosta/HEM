@@ -253,6 +253,8 @@ def main():
     parser.add_argument("--corpus", default="wikitext2",
                         choices=("wikitext2", "ptb"))
     parser.add_argument("--level", default="byte", choices=("byte", "word"))
+    parser.add_argument("--steps", type=int, default=0,
+                        help="override the tier's step count")
     parser.add_argument("--limit", type=int, default=0,
                         help="truncate each split; smoke tests only, and it "
                              "changes what is being measured")
@@ -261,6 +263,8 @@ def main():
     options = parser.parse_args()
 
     cfg = dict(TIERS[options.tier])
+    if options.steps:
+        cfg["steps"] = options.steps
     device = torch.device(options.device)
     seeds = [int(v) for v in options.seeds.split(",")]
     cells = options.cells.split(",")
