@@ -113,8 +113,8 @@ def measure(units: Sequence, label: str, top: int, window: int, seed: int) -> Di
             "delta": delta, "linked_fraction": linked, "valid": valid}
 
 
-def patch_profiles(sequence: Sequence[int], k: int, top: int, window: int
-                   ) -> torch.Tensor:
+def patch_profiles(sequence: Sequence[int], k: int, top: int, window: int,
+                   scramble: bool = False, seed: int = 0) -> torch.Tensor:
     """Patches as aggregates of their tokens' co-occurrence profiles.
 
     Raw K-gram co-occurrence is unusable past K=2: the top 4-grams barely
@@ -131,13 +131,28 @@ def patch_profiles(sequence: Sequence[int], k: int, top: int, window: int
     index = {unit: i for i, unit in enumerate(vocabulary)}
     profiles = 1.0 - token_distances          # similarity, dense by construction
 
+    # The control that decides whether any K-trend is linguistic. Averaging K
+    # vectors pulls points toward the centroid, which can raise normalised delta
+    # by arithmetic alone. `scramble` builds patches from tokens drawn at random
+    # from the whole sequence instead of consecutive ones: identical averaging,
+    # no adjacency. A trend that survives in the scrambled series is an artefact
+    # of the mean, not a property of language.
+    generator = torch.Generator().manual_seed(seed)
     rows = []
-    for start in range(0, len(sequence) - k + 1, k):
-        members = [index[t] for t in sequence[start:start + k] if t in index]
-        if len(members) == k:                  # only fully in-vocabulary patches
-            rows.append(profiles[members].mean(0))
-        if len(rows) >= top:
-            break
+    if scramble:
+        pool = [index[t] for t in sequence if t in index]
+        if len(pool) < k:
+            return torch.zeros((0, 0), dtype=torch.float64)
+        picks = torch.randint(0, len(pool), (top, k), generator=generator)
+        for row in picks:
+            rows.append(profiles[[pool[i] for i in row.tolist()]].mean(0))
+    else:
+        for start in range(0, len(sequence) - k + 1, k):
+            members = [index[t] for t in sequence[start:start + k] if t in index]
+            if len(members) == k:              # only fully in-vocabulary patches
+                rows.append(profiles[members].mean(0))
+            if len(rows) >= top:
+                break
     if len(rows) < 8:
         return torch.zeros((0, 0), dtype=torch.float64)
     matrix = torch.stack(rows)
@@ -168,17 +183,24 @@ def main():
         rows.append(measure(ngrams(sequence, k), f"K-gram atoms (K={k})",
                             options.units, options.window, options.seed))
 
-    # The construction the model uses: patches as aggregates of their tokens.
+    # The construction the model uses: patches as aggregates of their tokens,
+    # each paired with a scrambled control at the same K.
     for k in (1, 2, options.patch, 8):
-        distances = patch_profiles(sequence, k, options.units, options.window)
-        if distances.numel() == 0:
-            continue
-        linked = (distances < 0.999).float().mean().item()
-        rows.append({"label": f"aggregated profiles (K={k})",
-                     "units": len(sequence), "vocabulary": distances.shape[0],
-                     "linked_fraction": linked, "valid": True,
-                     "delta": delta_hyperbolicity(distances, samples=200000,
-                                                  seed=options.seed)})
+        for scramble in (False, True):
+            if k == 1 and scramble:
+                continue                        # identical to K=1 by definition
+            distances = patch_profiles(sequence, k, options.units,
+                                       options.window, scramble=scramble,
+                                       seed=options.seed)
+            if distances.numel() == 0:
+                continue
+            suffix = ", scrambled" if scramble else ""
+            rows.append({"label": f"aggregated profiles (K={k}{suffix})",
+                         "units": len(sequence), "vocabulary": distances.shape[0],
+                         "linked_fraction": (distances < 0.999).float().mean().item(),
+                         "valid": True,
+                         "delta": delta_hyperbolicity(distances, samples=200000,
+                                                      seed=options.seed)})
 
     generator = torch.Generator().manual_seed(options.seed)
     shuffled = torch.tensor(sequence)[torch.randperm(len(sequence),
@@ -211,9 +233,21 @@ def main():
           f"the gap to shuffled text is structure.")
     print(f"\ntoken delta {token_delta:.4f}  ->  K={options.patch} patch delta "
           f"{patch_delta:.4f}   ratio {patch_delta / token_delta:.3f}")
+    scrambled = next((r["delta"] for r in rows
+                      if r["label"] == f"aggregated profiles (K={options.patch}, "
+                                       f"scrambled)"), float("nan"))
+    if not math.isnan(scrambled):
+        print(f"scrambled control at K={options.patch}: {scrambled:.4f}  "
+              f"(same averaging, no adjacency)")
+        if abs(patch_delta - scrambled) < 0.15 * max(patch_delta, 1e-9):
+            print("  The trend survives scrambling, so it is arithmetic -- "
+                  "averaging K vectors\n  concentrates them regardless of what "
+                  "they are. NOT a fact about language.")
+            return
     if patch_delta > token_delta * 1.05:
-        print("  Patches are LESS tree-like than their tokens. Patching flattens "
-              "the structure\n  HELM exploits -- the HIERARCHY.md worry, in the "
+        print("  Patches are LESS tree-like than their tokens, and the "
+              "scrambled control does not\n  reproduce it. Patching flattens "
+              "the structure HELM exploits -- the HIERARCHY.md\n  worry, in the "
               "data rather than through a model.")
     elif patch_delta < token_delta * 0.95:
         print("  Patches are MORE tree-like. The strongest case for HELM-CALM, "
