@@ -35,6 +35,8 @@ from helm.hypercore.nn.conv.conv_util_layers import LResNet, LorentzRMSNorm
 from helm.hypercore.nn.linear.lorentz_linear import LorentzLinear
 from helm.modules.helm_mice import HelmMiCE
 
+from CALM.hyperbolic_latent import lorentz_energy_score
+
 __all__ = ["LorentzPatchEmbedding", "CalmEnergyHead", "LorentzEnergyHead",
            "PatchAutoencoder", "HelmCALM", "energy_score"]
 
@@ -171,8 +173,12 @@ class LorentzEnergyHead(nn.Module):
     This version keeps the same topology -- noise embedding, hidden embedding,
     ``num_mlp_layers`` gated residual blocks, a final projection -- but built
     from ``LorentzLinear``, ``LorentzRMSNorm`` and ``LResNet``, so every
-    intermediate activation stays on the manifold. Only the very last projection
-    leaves it, because the autoencoder's latent is Euclidean.
+    intermediate activation stays on the manifold.
+
+    With ``on_manifold=False`` the very last projection still leaves it, because
+    the autoencoder's latent is Euclidean. Pass ``on_manifold=True`` -- which
+    :class:`HelmCALM` does automatically for a hyperbolic autoencoder -- and that
+    last seam closes too.
     """
 
     class Block(nn.Module):
@@ -200,10 +206,15 @@ class LorentzEnergyHead(nn.Module):
             return self.residual(x, step)
 
     def __init__(self, manifold, hidden_size: int, latent_size: int,
-                 noise_size: int = 64, num_mlp_layers: int = 4):
+                 noise_size: int = 64, num_mlp_layers: int = 4,
+                 on_manifold: bool = False):
         super().__init__()
         self.manifold = manifold
         self.noise_size = noise_size
+        # With a hyperbolic latent there is nothing left to step off onto, so the
+        # final projection keeps its time coordinate and the head is hyperbolic
+        # end to end. See ``hyperbolic_latent``.
+        self.on_manifold = on_manifold
         self.noise_embd = LorentzLinear(manifold, noise_size + 1, hidden_size - 1)
         self.hidden_embd = LorentzLinear(manifold, hidden_size, hidden_size - 1)
         self.blocks = nn.ModuleList(
@@ -224,8 +235,9 @@ class LorentzEnergyHead(nn.Module):
         y = self.hidden_embd(hidden_states)
         for block in self.blocks:
             h = block(h, y)
-        # The latent is Euclidean, so the last step leaves the manifold.
-        return self.final(self.final_norm(h), return_space=True)
+        # With a Euclidean latent the last step is forced off the manifold; with
+        # a hyperbolic one it is not, and the head stays on it throughout.
+        return self.final(self.final_norm(h), return_space=not self.on_manifold)
 
 
 class PatchAutoencoder(nn.Module):
@@ -376,12 +388,25 @@ class HelmCALM(nn.Module):
 
         self.patch_embed = LorentzPatchEmbedding(manifolds[1], args.dim,
                                                  self.patch_size)
+        # A hyperbolic autoencoder changes what the head must produce and how
+        # the energy score measures it, so it is detected rather than configured
+        # -- the two cannot be mixed.
+        self.hyperbolic_latent = bool(getattr(autoencoder, "is_hyperbolic", False))
+        if bool(getattr(autoencoder, "is_hyperbolic", False)) and beta != 1.0:
+            raise ValueError("beta must be 1.0 with a hyperbolic latent: d^beta "
+                             "is conditionally negative definite on hyperbolic "
+                             "space only for beta in (0, 1], and beta < 1 gives "
+                             "unbounded self-distance gradients")
+        if self.hyperbolic_latent and head_kind != "lorentz":
+            raise ValueError("a hyperbolic latent needs head_kind='lorentz'; a "
+                             "Euclidean head cannot emit a point on the manifold")
         if head_kind == "lorentz":
             # A hyperbolic head consumes the manifold point unchanged.
             self.input_map = "direct"
             head_width = args.dim
             self.head = LorentzEnergyHead(manifolds[2], head_width,
-                                          autoencoder.latent_size)
+                                          autoencoder.latent_size,
+                                          on_manifold=self.hyperbolic_latent)
         else:
             head_width = args.dim if input_map != "space" else args.dim - 1
             self.head = CalmEnergyHead(head_width, autoencoder.latent_size)
@@ -426,13 +451,25 @@ class HelmCALM(nn.Module):
     # ------------------------------------------------------------------ heads
 
     def loss(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Energy loss for next-patch prediction. ``(B, S)`` -> scalar."""
+        """Energy loss for next-patch prediction. ``(B, S)`` -> scalar.
+
+        Both branches run the same estimator; only the metric differs. With a
+        hyperbolic latent the target is a wrapped normal and the distance is
+        geodesic, and ``beta`` is pinned to 1 -- ``d^beta`` is conditionally
+        negative definite on hyperbolic space only for ``beta`` in (0, 1], so the
+        Euclidean licence to go up to 2 does not carry over.
+        """
         inputs, targets = self._aligned(tokens)
         with torch.no_grad():
-            mean, log_std = self.autoencoder.encode(targets)
+            posterior = self.autoencoder.encode(targets)
         hidden = self.head_input(self.hidden_states(inputs)).reshape(-1, self.head_width)
         samples = self.head(hidden.unsqueeze(0).expand(self.num_samples, -1, -1))
-        return -energy_score(samples, mean, log_std, beta=self.beta).mean()
+        if self.hyperbolic_latent:
+            score = lorentz_energy_score(samples, posterior,
+                                         c=self.backbone.manifold_out.c)
+        else:
+            score = energy_score(samples, *posterior, beta=self.beta)
+        return -score.mean()
 
     @torch.no_grad()
     def sample_tokens(self, tokens: torch.Tensor, n_samples: Optional[int] = None
