@@ -46,11 +46,26 @@ __all__ = ["LorentzPatchEmbedding", "CalmEnergyHead", "LorentzEnergyHead",
 class LorentzPatchEmbedding(nn.Module):
     """Collapse K Lorentz token vectors into one, staying on the manifold.
 
-    CALM concatenates K Euclidean token embeddings and projects them. HELM's
-    embeddings are points on a hyperboloid, and concatenating those lands on no
-    manifold at all. Here the K *space-like* parts are concatenated and the time
-    coordinate recomputed — a valid point in a wider Minkowski space — then a
-    ``LorentzLinear`` maps it back onto the model's manifold.
+    Mirrors CALM's ``embed_proj`` (``modeling_energy.py``), which is **not** a
+    single projection:
+
+    .. code-block:: python
+
+        nn.Sequential(nn.Linear(patch_size * hidden, 2 * hidden), nn.SiLU(),
+                      nn.Linear(2 * hidden, hidden),
+                      nn.LayerNorm(hidden, eps=1e-6))
+
+    An earlier version of this class used one ``LorentzLinear``. That is a
+    quarter of the depth CALM found necessary, and it sits exactly where the
+    open question lives: this layer is what turns K tokens into one vector, so
+    if patching destroys the hierarchy HELM exists to model (``HIERARCHY.md``),
+    this is the layer that decides it. Under-building it and then asking whether
+    hierarchy survives patching would confound the answer with our own capacity.
+
+    Built from ``LorentzLinear`` and ``LorentzRMSNorm`` so the widened path stays
+    on the manifold, with the gating nonlinearity applied to the space part and
+    the time coordinate recomputed after it -- the same pattern
+    :class:`LorentzEnergyHead.Block` uses.
     """
 
     def __init__(self, manifold: Lorentz, dim: int, patch_size: int):
@@ -58,7 +73,16 @@ class LorentzPatchEmbedding(nn.Module):
         self.manifold = manifold
         self.patch_size = patch_size
         self.dim = dim
-        self.proj = LorentzLinear(manifold, patch_size * (dim - 1) + 1, dim - 1)
+        width = dim - 1
+        self.expand = LorentzLinear(manifold, patch_size * width + 1, 2 * width)
+        self.proj = LorentzLinear(manifold, 2 * width + 1, width)
+        self.norm = LorentzRMSNorm(manifold, width)
+
+    def _lift(self, space: torch.Tensor) -> torch.Tensor:
+        """Space-like coordinates -> a point on the hyperboloid."""
+        time = (space.square().sum(-1, keepdim=True)
+                + self.manifold.c).clamp_min(1e-8).sqrt()
+        return torch.cat([time, space], dim=-1)
 
     def forward(self, tokens_on_manifold: torch.Tensor) -> torch.Tensor:
         """``(B, S, dim)`` -> ``(B, S // patch_size, dim)``."""
@@ -70,9 +94,8 @@ class LorentzPatchEmbedding(nn.Module):
                 f"{self.patch_size}")
         space = space.reshape(batch, seqlen // self.patch_size,
                               self.patch_size * width)
-        time = (space.square().sum(-1, keepdim=True)
-                + self.manifold.c).clamp_min(1e-8).sqrt()
-        return self.proj(torch.cat([time, space], dim=-1))
+        wide = self.expand(self._lift(space), return_space=True)
+        return self.norm(self.proj(self._lift(F.silu(wide))))
 
 
 class CalmEnergyHead(nn.Module):
@@ -171,7 +194,9 @@ class LorentzEnergyHead(nn.Module):
     *internal* operations still assume a flat space.
 
     This version keeps the same topology -- noise embedding, hidden embedding,
-    ``num_mlp_layers`` gated residual blocks, a final projection -- but built
+    ``num_mlp_layers`` gated residual blocks, a two-layer final projection --
+    including the per-branch entry norms and the gated FinalLayer that CALM has
+    and an earlier version of this class omitted -- but built
     from ``LorentzLinear``, ``LorentzRMSNorm`` and ``LResNet``, so every
     intermediate activation stays on the manifold.
 
@@ -217,9 +242,18 @@ class LorentzEnergyHead(nn.Module):
         self.on_manifold = on_manifold
         self.noise_embd = LorentzLinear(manifold, noise_size + 1, hidden_size - 1)
         self.hidden_embd = LorentzLinear(manifold, hidden_size, hidden_size - 1)
+        # CALM normalises the two branches separately before the blocks --
+        # `norm_noise(noise_embd(noise))` and `norm_hidden(hidden_embd(h))`.
+        # They enter at very different scales (uniform noise against a
+        # normalised hidden state), so omitting these is not cosmetic.
+        self.norm_noise = LorentzRMSNorm(manifold, hidden_size - 1)
+        self.norm_hidden = LorentzRMSNorm(manifold, hidden_size - 1)
         self.blocks = nn.ModuleList(
             [self.Block(manifold, hidden_size) for _ in range(num_mlp_layers)])
+        # CALM's FinalLayer is LayerNorm -> Linear -> SiLU -> Linear, not a
+        # single projection. Only the last linear is zero-initialised.
         self.final_norm = LorentzRMSNorm(manifold, hidden_size - 1)
+        self.final_hidden = LorentzLinear(manifold, hidden_size, hidden_size - 1)
         self.final = LorentzLinear(manifold, hidden_size, latent_size)
         # Matching CALM: start neutral so the head does not fight the backbone.
         nn.init.zeros_(self.final.linear.weight)
@@ -231,13 +265,19 @@ class LorentzEnergyHead(nn.Module):
                            device=hidden_states.device) - 0.5
         time = (noise.square().sum(-1, keepdim=True)
                 + self.manifold.c).clamp_min(1e-8).sqrt()
-        h = self.noise_embd(torch.cat([time, noise], dim=-1))
-        y = self.hidden_embd(hidden_states)
+        h = self.norm_noise(self.noise_embd(torch.cat([time, noise], dim=-1)))
+        y = self.norm_hidden(self.hidden_embd(hidden_states))
         for block in self.blocks:
             h = block(h, y)
-        # With a Euclidean latent the last step is forced off the manifold; with
-        # a hyperbolic one it is not, and the head stays on it throughout.
-        return self.final(self.final_norm(h), return_space=not self.on_manifold)
+        h = self.final_hidden(self.final_norm(h), return_space=True)
+        time = (h.square().sum(-1, keepdim=True)
+                + self.manifold.c).clamp_min(1e-8).sqrt()
+        h = torch.cat([time, F.silu(h)], dim=-1)
+        # HELM's own vocabulary head ends the same way -- final_proj with
+        # return_space=True into a Euclidean linear -- so leaving the manifold
+        # here is faithful to the architecture, not a compromise. See
+        # PORTING.md section 1.
+        return self.final(h, return_space=not self.on_manifold)
 
 
 class PatchAutoencoder(nn.Module):
@@ -265,10 +305,20 @@ class PatchAutoencoder(nn.Module):
             return x + self.down(F.silu(self.gate(h)) * self.up(h))
 
     def __init__(self, vocab_size: int, hidden: int = 256, latent_size: int = 128,
-                 patch_size: int = 4, layers: int = 2):
+                 patch_size: int = 4, layers: int = 2,
+                 kl_clamp: float = 0.5, dropout: float = 0.15):
         super().__init__()
         self.patch_size = patch_size
         self.latent_size = latent_size
+        # Both defaults are CALM's (configuration_autoencoder.py). An earlier
+        # version of this class had neither, which is not a small omission:
+        # `kl_clamp` is free bits -- it stops the KL from switching off latent
+        # dimensions the decoder has not learned to use yet -- and the dropout
+        # forces the decoder to tolerate a noisy latent, which is exactly the
+        # condition it meets at inference, where the latent comes from the
+        # energy head rather than from the encoder.
+        self.kl_clamp = kl_clamp
+        self.dropout = dropout
         self.embed = nn.Embedding(vocab_size, hidden)
         self.enc_a = nn.ModuleList([self.Block(hidden) for _ in range(layers)])
         self.squeeze = nn.Linear(patch_size * hidden, hidden)
@@ -304,12 +354,20 @@ class PatchAutoencoder(nn.Module):
         return self.head(self.dec_norm(h))
 
     def elbo(self, ids: torch.Tensor, kl_weight: float = 1e-3):
-        """Reconstruction + KL, for pretraining. Returns ``(loss, recon_ce)``."""
+        """Reconstruction + free-bits KL, for pretraining.
+
+        Follows ``upstream/models/modeling_autoencoder.py``: the per-dimension
+        KL is clamped from below before summing, and the sampled latent passes
+        through dropout. Returns ``(loss, recon_ce)``.
+        """
         mean, log_std = self.encode(ids)
         latent = mean + torch.randn_like(mean) * log_std.exp()
+        latent = F.dropout(latent, p=self.dropout, training=self.training)
         logits = self.decode(latent)
         recon = F.cross_entropy(logits.reshape(-1, logits.size(-1)), ids.reshape(-1))
-        kl = (0.5 * (mean.pow(2) + (2 * log_std).exp() - 1) - log_std).sum(-1).mean()
+        # Free bits: clamped per dimension, then summed -- not clamped on the sum.
+        kl = 0.5 * (mean.pow(2) + (2 * log_std).exp() - 1) - log_std
+        kl = kl.clamp(min=self.kl_clamp).sum(-1).mean()
         return recon * self.patch_size + kl_weight * kl, recon
 
     def freeze(self) -> "PatchAutoencoder":
