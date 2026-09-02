@@ -167,6 +167,14 @@ was not, and that was worth 7.5 points.
 Two seeds left the residual gap ambiguous. Five settle it. Tree language, K=1,
 4000 steps, identical data and schedule, only the seed varying:
 
+> **Correction (see `EVALUATION.md` §1).** The script behind this table trains
+> and evaluates on the *same* sixteen batches — 1024 tokens seen ~250 times. The
+> numbers below are **training-set accuracies**, so they measure memorisation
+> capacity under the energy objective, not generalisation. Both arms are measured
+> identically, so the 2.94-point *difference* stands; the absolute figures do not
+> mean what an accuracy on held-out text would mean, and nothing here establishes
+> which architecture is the better language model.
+
 | | s0 | s1 | s2 | s3 | s4 | mean | sd |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | CALM + HELM (Lorentz head) | 93.65% | 96.98% | 96.47% | 96.67% | 96.98% | **96.15%** | 1.41% |

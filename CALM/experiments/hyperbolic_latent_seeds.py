@@ -10,6 +10,14 @@ off the manifold at its final layer.
 This runs the same protocol as ``seed_variance.py`` with a third arm added, so
 the numbers are directly comparable to the table already in the docs.
 
+**Held-out evaluation.** ``seed_variance.py``, whose table reached
+``DID_IT_WORK.md`` §5, trained and evaluated on the *same* sixteen batches. Its
+numbers are therefore training-set accuracy over 1024 tokens seen ~250 times
+each -- a memorisation measure, not a generalisation one. This script draws
+evaluation sequences from the same grammar under disjoint seeds and reports both,
+so the difference between memorising and generalising is visible rather than
+assumed. See ``EVALUATION.md``.
+
 **The confound this controls for.** The two arms use *different autoencoders*,
 and downstream accuracy cannot exceed what the autoencoder can reconstruct. A
 hyperbolic latent that simply reconstructs worse would look like a loss even if
@@ -42,7 +50,10 @@ LANGUAGE = HierarchicalLanguage(3, 4)
 ARGS = tiny_args(vocab_size=LANGUAGE.vocab_size, dim=33, n_layers=3,
                  max_seq_len=32, original_seq_len=32)
 BATCHES = [LANGUAGE.sample(2, 32, seed=i) for i in range(16)]
+#: Same grammar, disjoint seeds -- sequences the model never trains on.
+HELD_OUT = [LANGUAGE.sample(2, 32, seed=1000 + i) for i in range(16)]
 FLAT = torch.cat([b.reshape(-1) for b in BATCHES]).view(-1, 1)
+FLAT_HELD_OUT = torch.cat([b.reshape(-1) for b in HELD_OUT]).view(-1, 1)
 
 
 def train_autoencoder(cls, seed=0, steps=800):
@@ -61,13 +72,14 @@ def train_autoencoder(cls, seed=0, steps=800):
 
 
 @torch.no_grad()
-def autoencoder_ceiling(autoencoder):
+def autoencoder_ceiling(autoencoder, ids=None):
     """Round-trip accuracy: the most any head built on this latent can score."""
-    posterior = autoencoder.encode(FLAT)
+    ids = FLAT_HELD_OUT if ids is None else ids
+    posterior = autoencoder.encode(ids)
     latent = (posterior.mean if getattr(autoencoder, "is_hyperbolic", False)
               else posterior[0])
     predicted = autoencoder.decode(latent).argmax(-1)
-    return (predicted == FLAT).float().mean().item()
+    return (predicted == ids).float().mean().item()
 
 
 def run_helm(autoencoder, seed):
@@ -85,13 +97,17 @@ def run_helm(autoencoder, seed):
         optimizer.step()
         model.retract_manifold_parameters()
     model.eval()
-    correct = total = 0
-    with torch.no_grad():
-        for tokens in BATCHES:
-            predicted, targets = model.predict_tokens(tokens, n_samples=32)
-            correct += (predicted == targets).sum().item()
-            total += targets.numel()
-    return correct / total
+
+    def accuracy(batches):
+        correct = total = 0
+        with torch.no_grad():
+            for tokens in batches:
+                predicted, targets = model.predict_tokens(tokens, n_samples=32)
+                correct += (predicted == targets).sum().item()
+                total += targets.numel()
+        return correct / total
+
+    return accuracy(BATCHES), accuracy(HELD_OUT)
 
 
 def run_euclidean(autoencoder, seed, width=33):
@@ -118,22 +134,30 @@ def run_euclidean(autoencoder, seed, width=33):
         optimizer.step()
     backbone.eval()
     head.eval()
-    correct = total = 0
-    with torch.no_grad():
-        for tokens in BATCHES:
-            targets = tokens[:, 1:].reshape(-1)
-            hidden = backbone(tokens)[:, :-1].reshape(-1, width)
-            drawn = head.sample(hidden.unsqueeze(0).expand(32, -1, -1))
-            decoded = autoencoder.decode(drawn).argmax(-1).squeeze(-1)
-            correct += (torch.mode(decoded, dim=0).values == targets).sum().item()
-            total += targets.numel()
-    return correct / total
+
+    def accuracy(batches):
+        correct = total = 0
+        with torch.no_grad():
+            for tokens in batches:
+                targets = tokens[:, 1:].reshape(-1)
+                hidden = backbone(tokens)[:, :-1].reshape(-1, width)
+                drawn = head.sample(hidden.unsqueeze(0).expand(32, -1, -1))
+                decoded = autoencoder.decode(drawn).argmax(-1).squeeze(-1)
+                correct += (torch.mode(decoded, dim=0).values == targets).sum().item()
+                total += targets.numel()
+        return correct / total
+
+    return accuracy(BATCHES), accuracy(HELD_OUT)
 
 
-def summarise(name, values, ceiling):
-    mean, sd = statistics.mean(values), statistics.stdev(values)
-    cells = " ".join(f"{v:6.2%}" for v in values)
-    print(f"{name:34s} {cells} {mean:8.2%}{sd:7.2%}  {mean / ceiling:7.2%}")
+def summarise(name, results, ceiling):
+    """``results`` is a list of ``(train, held_out)`` pairs, one per seed."""
+    train = [t for t, _ in results]
+    held = [h for _, h in results]
+    mean, sd = statistics.mean(held), statistics.stdev(held)
+    cells = " ".join(f"{v:6.2%}" for v in held)
+    print(f"{name:34s} {cells} {mean:8.2%}{sd:7.2%}  {mean / ceiling:7.2%}"
+          f"  {statistics.mean(train):7.2%}")
     return mean, sd
 
 
@@ -143,10 +167,16 @@ def main():
     ceilings = {"euclidean": autoencoder_ceiling(euclidean_ae),
                 "hyperbolic": autoencoder_ceiling(hyperbolic_ae)}
     print(f"{len(SEEDS)} seeds, tree language, K=1, {STEPS} steps")
-    print(f"autoencoder ceilings: Euclidean {ceilings['euclidean']:.2%}, "
-          f"hyperbolic {ceilings['hyperbolic']:.2%}\n")
+    print(f"autoencoder ceilings (held out): Euclidean {ceilings['euclidean']:.2%}, "
+          f"hyperbolic {ceilings['hyperbolic']:.2%}")
+    print(f"autoencoder ceilings (train):    Euclidean "
+          f"{autoencoder_ceiling(euclidean_ae, FLAT):.2%}, hyperbolic "
+          f"{autoencoder_ceiling(hyperbolic_ae, FLAT):.2%}\n")
     header = " ".join(f"s{s}".rjust(6) for s in SEEDS)
-    print(f"{'':34s} {header} {'mean':>8s}{'sd':>7s}  {'of ceil':>7s}")
+    print("held-out accuracy per seed; 'train' is the same models on the data "
+          "they were fitted to")
+    print(f"{'':34s} {header} {'mean':>8s}{'sd':>7s}  {'of ceil':>7s}  "
+          f"{'train':>7s}")
 
     control = summarise("CALM + Euclidean (control)",
                         [run_euclidean(euclidean_ae, s) for s in SEEDS],
