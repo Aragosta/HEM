@@ -187,3 +187,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Benchmark corpora: fetched by CALM/suite/corpus.py, not vendored (19MB)
+CALM/data/*.txt
