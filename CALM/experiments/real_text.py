@@ -58,8 +58,12 @@ ROOT = Path(__file__).resolve().parents[2]
 for _extra in (ROOT, ROOT / "CALM", ROOT / "CALM" / "experiments"):
     sys.path.insert(0, str(_extra))
 
+import torch.nn as nn  # noqa: E402
+
 from brierlm import brier_lm, brier_scores  # noqa: E402
-from helm_calm import HelmCALM, PatchAutoencoder  # noqa: E402
+from stage1_energy_head import EuclideanBackbone  # noqa: E402
+from helm_calm import CalmEnergyHead  # noqa: E402
+from helm_calm import HelmCALM, PatchAutoencoder, energy_score  # noqa: E402
 from helm.hypercore.manifolds import Lorentz  # noqa: E402
 from helm.modules.helm_mice import HelmMiCE  # noqa: E402
 from hyperbolic_latent import LorentzPatchAutoencoder  # noqa: E402
@@ -116,6 +120,61 @@ def batches_from(data: torch.Tensor, batch_size: int, seq_len: int, count: int,
     return out
 
 
+# ------------------------------------------------------------------ controls
+
+class EuclideanCalm(nn.Module):
+    """HELM-CALM with the geometry removed and nothing else changed.
+
+    This is the arm that answers "does hyperbolic geometry help or hurt under
+    CALM's objective". It mirrors :class:`~CALM.helm_calm.HelmCALM` piece for
+    piece -- patch embedding, backbone of the same width and depth, CALM's
+    generative head, the same frozen autoencoder, the same energy score, the
+    same optimizer and budget -- and differs *only* in that every component is
+    flat. Any difference between this and the HELM arm is attributable to the
+    manifold, and to nothing else.
+
+    Matched at ``dim - 1``: a Lorentz vector of width ``dim`` carries ``dim - 1``
+    free coordinates, since the time coordinate is determined by the rest. Giving
+    the Euclidean control ``dim`` features would hand it one extra free parameter
+    per position and turn a geometry comparison into a capacity comparison.
+    """
+
+    def __init__(self, vocab_size, dim, layers, heads, inter, patch, latent):
+        super().__init__()
+        self.patch_size = patch
+        self.width = dim - 1
+        # HELM's head count is chosen for HMLA's latent shapes and need not
+        # divide dim - 1. Plain multi-head attention does require that, so pick
+        # the nearest divisor. Head count is not the variable under test.
+        if self.width % heads:
+            divisors = [h for h in range(1, self.width + 1) if self.width % h == 0]
+            heads = min(divisors, key=lambda h: (abs(h - heads), h))
+        self.embed = nn.Embedding(vocab_size, self.width)
+        self.patch_embed = nn.Linear(patch * self.width, self.width)
+        # Reuse the control backbone's layers, but feed them patch vectors
+        # directly instead of token ids -- its own embedding is left unused
+        # rather than modifying stage1_energy_head, which other experiments read.
+        self.backbone = EuclideanBackbone(vocab_size, self.width, layers, heads,
+                                          inter)
+        del self.backbone.embed
+        self.head = CalmEnergyHead(self.width, latent)
+
+    def hidden_states(self, tokens):
+        embedded = self.embed(tokens)
+        b, s, _ = embedded.shape
+        x = self.patch_embed(embedded.reshape(b, s // self.patch_size, -1))
+        x = x + self.backbone.pos[:, :x.size(1)]
+        for layer in self.backbone.layers:
+            x = layer(x)
+        return self.backbone.norm(x)
+
+    def _aligned(self, tokens):
+        n_patches = tokens.size(1) // self.patch_size
+        inputs = tokens[:, :(n_patches - 1) * self.patch_size]
+        targets = tokens[:, self.patch_size:n_patches * self.patch_size]
+        return inputs, targets.reshape(-1, self.patch_size)
+
+
 # --------------------------------------------------------------------- arms
 
 def model_args(seq_len: int) -> object:
@@ -155,6 +214,17 @@ def bits_per_byte(model, batches) -> float:
         total_nats += loss.item() * count
         total_bytes += count
     return total_nats / total_bytes / math.log(2)
+
+
+@torch.no_grad()
+def discrete_draw(model, tokens, n):
+    """``(n, B, S-1)`` independent teacher-forced draws."""
+    out = model(tokens[:, :-1])
+    logits = (out[0] if isinstance(out, tuple) else out).float()
+    probs = logits.softmax(-1)
+    flat = probs.reshape(-1, probs.size(-1))
+    drawn = torch.multinomial(flat, n, replacement=True).T
+    return drawn.reshape(n, *probs.shape[:-1])
 
 
 @torch.no_grad()
@@ -218,7 +288,96 @@ def train_calm(args, autoencoder, train_batches, steps, lr):
     return model.eval()
 
 
+def train_euclidean_calm(args, autoencoder, train_batches, steps, lr, patch):
+    torch.manual_seed(0)
+    model = EuclideanCalm(VOCAB, args.dim, args.n_layers, args.n_heads,
+                          args.inter_dim, patch, autoencoder.latent_size)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=lr)
+    model.train()
+    for step in range(steps):
+        tokens = train_batches[step % len(train_batches)]
+        inputs, targets = model._aligned(tokens)
+        with torch.no_grad():
+            mean, log_std = autoencoder.encode(targets)
+        hidden = model.hidden_states(inputs).reshape(-1, model.width)
+        samples = model.head(hidden.unsqueeze(0).expand(8, -1, -1))
+        loss = -energy_score(samples, mean, log_std).mean()
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        optimizer.step()
+    return model.eval()
+
+
+@torch.no_grad()
+def euclidean_calm_draw(model, autoencoder, tokens, n):
+    """``(n, B, S')`` byte draws plus targets -- the same shape the HELM arm gives."""
+    inputs, targets = model._aligned(tokens)
+    hidden = model.hidden_states(inputs).reshape(-1, model.width)
+    latents = model.head(hidden.unsqueeze(0).expand(n, -1, -1))
+    decoded = autoencoder.decode(latents).argmax(-1)
+    rows = tokens.size(0)
+    return decoded.reshape(n, rows, -1), targets.reshape(rows, -1)
+
+
+# ------------------------------------------------------------------ baselines
+
+def byte_baselines(train_data, valid_batches):
+    """What a lookup table achieves on the same held-out bytes.
+
+    The lesson from the tree-language run: a neural accuracy is uninterpretable
+    without this. A model that cannot beat a bigram table has not learned the
+    corpus, whatever its training loss says.
+    """
+    import collections
+    counts = collections.Counter(train_data.tolist())
+    mode = counts.most_common(1)[0][0]
+    following = collections.defaultdict(collections.Counter)
+    previous = train_data[:-1].tolist()
+    nxt = train_data[1:].tolist()
+    for a, b in zip(previous, nxt):
+        following[a][b] += 1
+    best = {k: v.most_common(1)[0][0] for k, v in following.items()}
+
+    # Bits per byte for the smoothed bigram model, so the neural BPB has a
+    # reference on its own scale as well.
+    vocab_totals = {k: sum(v.values()) for k, v in following.items()}
+    correct = total = 0
+    nats = 0.0
+    for tokens in valid_batches:
+        for row in tokens:
+            ids = row.tolist()
+            for a, b in zip(ids[:-1], ids[1:]):
+                total += 1
+                correct += (best.get(a, mode) == b)
+                table = following.get(a)
+                count = (table.get(b, 0) if table else 0)
+                denominator = (vocab_totals.get(a, 0) + VOCAB)
+                nats -= math.log((count + 1) / denominator)
+    return {"bigram top-1": correct / total,
+            "bigram BPB": nats / total / math.log(2),
+            "unigram mode top-1": sum(
+                (row == mode).sum().item() for t in valid_batches for row in t)
+            / sum(t.numel() for t in valid_batches)}
+
+
 # ------------------------------------------------------------------ scoring
+
+def top1_accuracy(draw, batches, n_samples=32) -> float:
+    """Modal prediction accuracy, in byte space, identical across all arms.
+
+    This is the number that can sit next to the bigram baseline, because it is
+    measured on the same quantity: which byte comes next.
+    """
+    correct = total = 0
+    for tokens in batches:
+        samples, targets = draw(tokens, n_samples)
+        predicted = torch.mode(samples, dim=0).values
+        correct += (predicted == targets).sum().item()
+        total += targets.numel()
+    return correct / total
+
 
 def score_brierlm(sampler, batches, max_n=4):
     """``sampler`` returns two independent draws and the targets, sequence-shaped.
@@ -252,7 +411,8 @@ def main():
     parser.add_argument("--patch", type=int, default=4)
     parser.add_argument("--latent", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--arms", default="discrete,euclidean,hyperbolic")
+    parser.add_argument(
+        "--arms", default="discrete,helm-calm,euclidean-calm,hyperbolic")
     args_cli = parser.parse_args()
     arms = set(args_cli.arms.split(","))
 
@@ -269,52 +429,99 @@ def main():
     args = model_args(args_cli.seq_len)
     results = {}
 
+    baselines = byte_baselines(train_data, valid_batches)
+    print("baselines on the same held-out bytes")
+    print(f"  bigram lookup table   top-1 {baselines['bigram top-1']:.2%}   "
+          f"BPB {baselines['bigram BPB']:.4f}")
+    print(f"  unigram mode          top-1 {baselines['unigram mode top-1']:.2%}")
+    print(f"  uniform               top-1 {1 / VOCAB:.2%}   BPB 8.0000\n")
+
     if "discrete" in arms:
         model = train_discrete(args, train_batches, args_cli.steps, args_cli.lr)
         results["discrete HELM"] = {
             "bpb": bits_per_byte(model, valid_batches),
             "bpb_train": bits_per_byte(model, train_batches[:16]),
+            "top1": top1_accuracy(
+                lambda t, n: (discrete_draw(model, t, n), t[:, 1:]),
+                valid_batches),
         }
         orders, aggregate = score_brierlm(
             lambda t: discrete_samples(model, t), valid_batches)
         results["discrete HELM"].update(brier_orders=orders, brierlm=aggregate)
 
-    for name, cls in (("euclidean", PatchAutoencoder),
-                      ("hyperbolic", LorentzPatchAutoencoder)):
-        if name not in arms:
+    # One autoencoder per latent geometry, shared by the arms that use it, so
+    # the HELM and Euclidean CALM arms differ only in the backbone.
+    autoencoders = {}
+    if arms & {"helm-calm", "euclidean-calm"}:
+        autoencoders["euclidean"] = train_autoencoder(
+            PatchAutoencoder, train_data, args_cli.patch, args_cli.latent,
+            args_cli.ae_steps)
+    if "hyperbolic" in arms:
+        autoencoders["hyperbolic"] = train_autoencoder(
+            LorentzPatchAutoencoder, train_data, args_cli.patch,
+            args_cli.latent, args_cli.ae_steps)
+
+    helm_arms = [("helm-calm", "HELM-CALM (hyperbolic backbone)", "euclidean"),
+                 ("hyperbolic", "HELM-CALM (+ hyperbolic latent)", "hyperbolic")]
+    for key, label, latent_kind in helm_arms:
+        if key not in arms:
             continue
-        autoencoder = train_autoencoder(cls, train_data, args_cli.patch,
-                                        args_cli.latent, args_cli.ae_steps)
+        autoencoder = autoencoders[latent_kind]
         model = train_calm(args, autoencoder, train_batches, args_cli.steps,
                            args_cli.lr)
 
-        def sampler(tokens, model=model, patch=args_cli.patch):
-            # sample_tokens flattens (batch, patch) into one position axis;
-            # folding it back recovers the byte sequence BrierLM needs.
-            samples, targets = model.sample_tokens(tokens, n_samples=2)
+        def draw(tokens, n, model=model):
+            samples, targets = model.sample_tokens(tokens, n_samples=n)
             rows = tokens.size(0)
-            reshape = lambda t: t.reshape(rows, -1)  # noqa: E731
-            return (reshape(samples[0]), reshape(samples[1]), reshape(targets))
+            return samples.reshape(n, rows, -1), targets.reshape(rows, -1)
+
+        def sampler(tokens, draw=draw):
+            first, targets = draw(tokens, 1)
+            second, _ = draw(tokens, 1)
+            return first[0], second[0], targets
 
         orders, aggregate = score_brierlm(sampler, valid_batches)
-        results[f"HELM-CALM ({name} latent)"] = {
+        results[label] = {
             "bpb": None,
             "ae_ceiling": autoencoder_ceiling(autoencoder, valid_data),
+            "top1": top1_accuracy(draw, valid_batches),
             "brier_orders": orders,
             "brierlm": aggregate,
         }
 
-    print(f"{'model':32s} {'BPB valid':>10s} {'BPB train':>10s} "
+    if "euclidean-calm" in arms:
+        autoencoder = autoencoders["euclidean"]
+        model = train_euclidean_calm(args, autoencoder, train_batches,
+                                     args_cli.steps, args_cli.lr, args_cli.patch)
+
+        def draw(tokens, n, model=model, ae=autoencoder):
+            return euclidean_calm_draw(model, ae, tokens, n)
+
+        def sampler(tokens, draw=draw):
+            first, targets = draw(tokens, 1)
+            second, _ = draw(tokens, 1)
+            return first[0], second[0], targets
+
+        orders, aggregate = score_brierlm(sampler, valid_batches)
+        results["CALM (Euclidean backbone, control)"] = {
+            "bpb": None,
+            "ae_ceiling": autoencoder_ceiling(autoencoder, valid_data),
+            "top1": top1_accuracy(draw, valid_batches),
+            "brier_orders": orders,
+            "brierlm": aggregate,
+        }
+
+    print(f"{'model':36s} {'top-1':>8s} {'BPB valid':>10s} {'BPB train':>10s} "
           f"{'brier_1':>9s} {'brier_2':>9s} {'brier_3':>9s} {'brier_4':>9s} "
-          f"{'BrierLM':>9s} {'AE ceil':>9s}")
+          f"{'AE ceil':>9s}")
     for name, row in results.items():
         bpb = f"{row['bpb']:.4f}" if row.get("bpb") is not None else "n/a"
         bpb_train = (f"{row['bpb_train']:.4f}" if row.get("bpb_train") is not None
                      else "n/a")
         ceiling = (f"{row['ae_ceiling']:.2%}" if "ae_ceiling" in row else "n/a")
         orders = " ".join(f"{v:9.5f}" for v in row["brier_orders"])
-        print(f"{name:32s} {bpb:>10s} {bpb_train:>10s} {orders} "
-              f"{row['brierlm']:9.4f} {ceiling:>9s}")
+        print(f"{name:36s} {row['top1']:8.2%} {bpb:>10s} {bpb_train:>10s} "
+              f"{orders} {ceiling:>9s}")
     print("\nBPB is n/a for HELM-CALM by construction: an implicit sampler has "
           "no density.\nA uniform byte model scores BPB 8.0000 and brier_n "
           "about 1/256 = 0.0039.\n"
