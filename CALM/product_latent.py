@@ -184,7 +184,8 @@ class ProductPatchAutoencoder(nn.Module):
     def __init__(self, vocab_size: int, hidden: int = 256, latent_size: int = 128,
                  patch_size: int = 4, layers: int = 2, c: float = -1.0,
                  learnable_curvature: bool = False,
-                 kl_clamp: float = 0.5, dropout: float = 0.15):
+                 kl_clamp: float = 0.5, dropout: float = 0.15,
+                 log_clamp: float = 6.0):
         super().__init__()
         from CALM.helm_calm import PatchAutoencoder  # same Block, no duplication
 
@@ -199,6 +200,13 @@ class ProductPatchAutoencoder(nn.Module):
         self.learnable_curvature = learnable_curvature
         self.kl_clamp = kl_clamp
         self.dropout = dropout
+        # Bound on log beta^2 and log gamma^2. It exists to keep the Gamma shape
+        # parameter where lgamma and digamma are well conditioned, not to
+        # constrain the model -- so it has to be checked for bindingness rather
+        # than assumed harmless. At 6.0 it was pinning roughly half of every
+        # batch, which makes an accuracy measured under it partly a measurement
+        # of the bound. `latent_geometry.py` reports the pinned fraction.
+        self.log_clamp = log_clamp
 
         self.embed = nn.Embedding(vocab_size, hidden)
         self.enc_a = nn.ModuleList([Block(hidden) for _ in range(layers)])
@@ -227,8 +235,9 @@ class ProductPatchAutoencoder(nn.Module):
         alpha, log_beta_sq, log_gamma_sq = parts[:3]
         # Both are logs of variances; clamping keeps the Gamma shape parameter
         # in a range where lgamma and digamma are well conditioned.
-        log_beta_sq = log_beta_sq.clamp(-6.0, 6.0)
-        log_gamma_sq = log_gamma_sq.clamp(-6.0, 6.0)
+        bound = self.log_clamp
+        log_beta_sq = log_beta_sq.clamp(-bound, bound)
+        log_gamma_sq = log_gamma_sq.clamp(-bound, bound)
         curvature = (-parts[3].clamp(-4.0, 4.0).exp() if self.learnable_curvature
                      else self.c)
         return ProductGaussianNormal(

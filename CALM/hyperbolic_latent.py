@@ -307,12 +307,17 @@ class LorentzPatchAutoencoder(nn.Module):
     def __init__(self, vocab_size: int, hidden: int = 256, latent_size: int = 128,
                  patch_size: int = 4, layers: int = 2,
                  manifold: Optional[Lorentz] = None,
-                 max_radius: float = MAX_TANGENT_RADIUS):
+                 max_radius: float = MAX_TANGENT_RADIUS,
+                 kl_clamp: float = 0.5, dropout: float = 0.15):
         super().__init__()
         from CALM.helm_calm import PatchAutoencoder  # same Block, no duplication
 
         self.manifold = manifold if manifold is not None else Lorentz(1.0)
         self.max_radius = max_radius
+        # CALM's autoencoder regularisers, matched to PatchAutoencoder so the
+        # latent is the only difference between the two.
+        self.kl_clamp = kl_clamp
+        self.dropout = dropout
         self.patch_size = patch_size
         self.latent_size = latent_size
         Block = PatchAutoencoder.Block
@@ -371,9 +376,10 @@ class LorentzPatchAutoencoder(nn.Module):
         """Reconstruction + Monte-Carlo KL. Returns ``(loss, recon_ce)``."""
         posterior = self.encode(ids)
         latent, _ = posterior.rsample()
+        latent = F.dropout(latent, p=self.dropout, training=self.training)
         logits = self.decode(latent)
         recon = F.cross_entropy(logits.reshape(-1, logits.size(-1)), ids.reshape(-1))
-        kl = posterior.kl_to_origin_prior().mean()
+        kl = posterior.kl_to_origin_prior().clamp(min=self.kl_clamp).mean()
         return recon * self.patch_size + kl_weight * kl, recon
 
     def freeze(self) -> "LorentzPatchAutoencoder":

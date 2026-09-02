@@ -65,11 +65,17 @@ from hyperbolic_latent import MAX_TANGENT_RADIUS, LorentzPatchAutoencoder  # noq
 from product_latent import ProductPatchAutoencoder, fisher_rao_distance  # noqa: E402
 from real_text import VOCAB, build_corpus  # noqa: E402
 
+def _drop(kw, *names):
+    """Pass only the knobs a builder understands."""
+    return {k: v for k, v in kw.items() if k not in names}
+
+
 BUILDERS = {
-    "euclidean": lambda **kw: PatchAutoencoder(**kw),
-    "wrapped": lambda **kw: LorentzPatchAutoencoder(**kw),
-    "product": lambda **kw: ProductPatchAutoencoder(**kw),
-    "learnable": lambda **kw: ProductPatchAutoencoder(learnable_curvature=True, **kw),
+    "euclidean": lambda **kw: PatchAutoencoder(**_drop(kw, "log_clamp", "max_radius")),
+    "wrapped": lambda **kw: LorentzPatchAutoencoder(**_drop(kw, "log_clamp")),
+    "product": lambda **kw: ProductPatchAutoencoder(**_drop(kw, "max_radius")),
+    "learnable": lambda **kw: ProductPatchAutoencoder(
+        learnable_curvature=True, **_drop(kw, "max_radius")),
 }
 
 
@@ -93,12 +99,13 @@ def probe(model, posterior):
     if getattr(model, "is_product", False):
         origin = torch.zeros_like(point)
         radius = fisher_rao_distance(point, origin, posterior.c)
-        clamped = ((posterior.log_beta_square.abs() > 5.99).float().mean()
-                   + (posterior.log_gamma_square.abs() > 5.99).float().mean()) / 2
+        edge = model.log_clamp - 0.01
+        clamped = ((posterior.log_beta_square.abs() > edge).float().mean()
+                   + (posterior.log_gamma_square.abs() > edge).float().mean()) / 2
         kl = posterior.kl_div(type(posterior).standard(posterior)).sum(-1)
     elif getattr(model, "is_hyperbolic", False):
         radius = model.manifold.logmap0(point)[..., 1:].norm(dim=-1)
-        clamped = (radius > MAX_TANGENT_RADIUS - 1e-3).float().mean()
+        clamped = (radius > model.max_radius - 1e-3).float().mean()
         kl = posterior.kl_to_origin_prior()
     else:
         mean, log_std = posterior
@@ -108,10 +115,11 @@ def probe(model, posterior):
     return radius.mean().item(), radius.max().item(), clamped.item(), kl.mean().item()
 
 
-def fit(name, train, patch, latent, hidden, steps, lr=3e-3, seed=0):
+def fit(name, train, patch, latent, hidden, steps, lr=3e-3, seed=0, clip=1.0,
+        **extra):
     torch.manual_seed(seed)
     model = BUILDERS[name](vocab_size=VOCAB, hidden=hidden, latent_size=latent,
-                           patch_size=patch)
+                           patch_size=patch, **extra)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     generator = torch.Generator().manual_seed(seed)
     rows = patches(train, patch)
@@ -125,7 +133,8 @@ def fit(name, train, patch, latent, hidden, steps, lr=3e-3, seed=0):
             continue
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         optimizer.step()
     return model.eval(), nonfinite
 
@@ -146,7 +155,20 @@ def main():
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--latents", default="16,64")
     parser.add_argument("--which", default="euclidean,wrapped,product,learnable")
+    parser.add_argument("--seeds", default="0")
+    parser.add_argument("--clip", type=float, default=1.0,
+                        help="gradient-norm clip; 0 disables. The wrapped normal "
+                             "scored 2.29%% without it and 80.91%% with it in "
+                             "otherwise identical runs, so it is a variable here "
+                             "rather than a fixed convenience")
+    parser.add_argument("--log-clamp", type=float, default=6.0,
+                        help="bound on log beta^2 / log gamma^2 for the product "
+                             "latents; raise it until 'clamped' reaches 0")
+    parser.add_argument("--max-radius", type=float, default=MAX_TANGENT_RADIUS,
+                        help="tangent-radius clamp for the wrapped normal; "
+                             "float32 fails past about 8")
     options = parser.parse_args()
+    seeds = [int(v) for v in options.seeds.split(",")]
 
     train, valid = build_corpus()
     print(f"K = {options.patch}, hidden = {options.hidden}, {options.steps} steps, "
@@ -154,19 +176,36 @@ def main():
     print("latent_size counts VALUES: a product factor holds two, so those "
           "latents use half as many\nfactors and every row sees the same number "
           "of numbers reaching the decoder.\n")
+    print(f"seeds {seeds}, log_clamp {options.log_clamp}, "
+          f"max_radius {options.max_radius}, grad clip {options.clip or 'off'}\n")
     print(f"{'latent':>7s} {'geometry':>10s} {'byte':>7s} {'patch':>7s} "
-          f"{'radius':>15s} {'clamped':>8s} {'KL':>9s} {'NaN':>5s}")
+          f"{'+-half':>7s} {'radius':>15s} {'clamped':>8s} {'KL':>9s} {'NaN':>5s}")
 
     for latent in (int(v) for v in options.latents.split(",")):
         for name in options.which.split(","):
-            model, nonfinite = fit(name, train, options.patch, latent,
-                                   options.hidden, options.steps)
-            byte, patch_accuracy = fidelity(model, valid, options.patch)
-            with torch.no_grad():
-                posterior = model.encode(patches(valid, options.patch)[:4096])
-                mean_r, max_r, clamped, kl = probe(model, posterior)
+            rows = []
+            for seed in seeds:
+                model, nonfinite = fit(name, train, options.patch, latent,
+                                       options.hidden, options.steps, seed=seed,
+                                       clip=options.clip,
+                                       log_clamp=options.log_clamp,
+                                       max_radius=options.max_radius)
+                byte, patch_accuracy = fidelity(model, valid, options.patch)
+                with torch.no_grad():
+                    posterior = model.encode(patches(valid, options.patch)[:4096])
+                    stats = probe(model, posterior)
+                rows.append((byte, patch_accuracy, *stats, nonfinite))
+            byte = sum(r[0] for r in rows) / len(rows)
+            accuracy = [r[1] for r in rows]
+            mean_r = sum(r[2] for r in rows) / len(rows)
+            max_r = max(r[3] for r in rows)
+            clamped = sum(r[4] for r in rows) / len(rows)
+            kl = sum(r[5] for r in rows) / len(rows)
+            nonfinite = sum(r[6] for r in rows)
+            spread = (max(accuracy) - min(accuracy)) if len(accuracy) > 1 else 0.0
             flag = "" if nonfinite == 0 else "  <- row invalid"
-            print(f"{latent:7d} {name:>10s} {byte:7.2%} {patch_accuracy:7.2%} "
+            print(f"{latent:7d} {name:>10s} {byte:7.2%} "
+                  f"{sum(accuracy)/len(accuracy):7.2%} +-{spread/2:5.2%} "
                   f"{mean_r:6.2f} (max {max_r:5.2f}) {clamped:8.1%} {kl:9.2f} "
                   f"{nonfinite:5d}{flag}", flush=True)
 
