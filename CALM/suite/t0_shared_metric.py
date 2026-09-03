@@ -133,6 +133,49 @@ def frequency_deciles(train_ids: torch.Tensor, vocab: int) -> torch.Tensor:
     return decile
 
 
+def build_optimizer(model, lr):
+    """Riemannian optimization for manifold parameters, AdamW for the rest.
+
+    HELM's paper: hyperbolic word embeddings "are then trained as hyperbolic
+    parameters **via Riemannian optimizers**". An earlier version of this script
+    used plain AdamW on everything and never retracted, so HELM's embedding --
+    a geoopt ManifoldParameter -- drifted off the hyperboloid during training.
+    That handicaps only the hyperbolic arm, which is the mirror image of the
+    confounds the first run had in HELM's favour.
+    """
+    from geoopt import ManifoldParameter
+    from geoopt.optim import RiemannianAdam
+
+    manifold, euclidean = [], []
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        (manifold if isinstance(parameter, ManifoldParameter) else euclidean
+         ).append(parameter)
+    optimizers = [torch.optim.AdamW(euclidean, lr=lr, weight_decay=0.01)]
+    if manifold:
+        optimizers.append(RiemannianAdam(manifold, lr=lr, weight_decay=0.01,
+                                         stabilize=10))
+    return optimizers, manifold
+
+
+def warmup_cosine(optimizers, steps, warmup_fraction=0.03, floor=0.1):
+    """HELM's schedule: cosine annealing to 0.1x, with 3% of steps as warmup.
+
+    The warmup was missing before. HELM diverged at 8e-4 while the Euclidean arm
+    did not, which is the signature of exactly that omission.
+    """
+    warmup = max(int(steps * warmup_fraction), 1)
+
+    def factor(step):
+        if step < warmup:
+            return (step + 1) / warmup
+        progress = (step - warmup) / max(steps - warmup, 1)
+        return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    return [torch.optim.lr_scheduler.LambdaLR(o, factor) for o in optimizers]
+
+
 def train_arm(name, args, cfg, stream, seed, device, lr, euclid_dim=None):
     torch.manual_seed(seed)
     if name == "helm":
@@ -146,21 +189,29 @@ def train_arm(name, args, cfg, stream, seed, device, lr, euclid_dim=None):
         step = model.loss
         logits_fn = model.logits
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=lr)
-    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg["steps"], eta_min=lr * 0.1)
+    optimizers, manifold = build_optimizer(model, lr)
+    schedules = warmup_cosine(optimizers, cfg["steps"])
     model.train()
     started = time.time()
     history = []
     for _ in range(cfg["steps"]):
         loss = step(next(stream).to(device))
-        optimizer.zero_grad()
+        for optimizer in optimizers:
+            optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
-        optimizer.step()
-        schedule.step()
+        for optimizer in optimizers:
+            optimizer.step()
+        for schedule in schedules:
+            schedule.step()
         history.append(loss.item())
-    return model.eval(), logits_fn, (time.time() - started) / cfg["steps"], history
+    violation = 0.0
+    for parameter in manifold:
+        d = parameter.detach()
+        quad = -d[..., 0] ** 2 + d[..., 1:].pow(2).sum(-1)
+        violation = max(violation, (quad + 1).abs().max().item())
+    return (model.eval(), logits_fn, (time.time() - started) / cfg["steps"],
+            history, violation)
 
 
 def main():
@@ -251,8 +302,8 @@ def main():
             for rate in rates:
                 stream = stream_from(train_ids, options.batch, options.seq_len,
                                      seed=0)
-                _, logits_fn, _, _ = train_arm(name, args, sweep_cfg, stream, 0,
-                                               device, rate, width)
+                _, logits_fn, _, _, _ = train_arm(name, args, sweep_cfg, stream,
+                                                  0, device, rate, width)
                 ppl, _ = perplexity_and_deciles(logits_fn, eval_batches[:8],
                                                 deciles)
                 print(f"{name:>8s} {rate:10.1e} {ppl:10.2f}", flush=True)
@@ -267,8 +318,8 @@ def main():
         cfg = dict(cfg, steps=10)
         for name in ("helm", "euclid"):
             stream = stream_from(train_ids, options.batch, options.seq_len, seed=0)
-            _, _, per_step, _ = train_arm(name, args, cfg, stream, 0, device,
-                                          options.lr, width)
+            _, _, per_step, _, _ = train_arm(name, args, cfg, stream, 0, device,
+                                             options.lr, width)
             print(f"  {name:7s} {per_step*1000:7.1f} ms/step -> "
                   f"{options.steps} steps = {per_step*options.steps/60:5.1f} min")
         return
@@ -278,7 +329,7 @@ def main():
         for seed in [int(s) for s in options.seeds.split(",")]:
             stream = stream_from(train_ids, options.batch, options.seq_len, seed=0)
             arm_lr = options.lr if name == "helm" else options.lr_dense
-            model, logits_fn, per_step, history = train_arm(
+            model, logits_fn, per_step, history, violation = train_arm(
                 name, args, cfg, stream, seed, device, arm_lr, width)
             ppl, by_decile = perplexity_and_deciles(logits_fn, eval_batches, deciles)
 
@@ -294,10 +345,12 @@ def main():
                    "ppl_by_decile": by_decile, "brier": brier,
                    "top1": M.top1_accuracy(draw, eval_batches[:8]),
                    "final_loss": statistics.mean(history[-100:]),
-                   "ms_per_step": per_step * 1000}
+                   "ms_per_step": per_step * 1000,
+                   "manifold_violation": violation}
             rows.append(row)
             print(f"{name:7s} seed {seed}  ppl {ppl:8.2f}  top1 {row['top1']:6.2%}  "
-                  f"brier1 {brier[0]:+.5f}  {per_step*1000:6.1f} ms/step", flush=True)
+                  f"brier1 {brier[0]:+.5f}  {per_step*1000:6.1f} ms/step  "
+                  f"manifold_err {violation:.2e}", flush=True)
 
     report(rows, options)
     if options.out:
