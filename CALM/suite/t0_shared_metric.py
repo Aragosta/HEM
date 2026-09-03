@@ -375,6 +375,15 @@ def main():
                    "ms_per_step": per_step * 1000,
                    "manifold_violation": violation}
             rows.append(row)
+            # Write after every row. Three container reaps have already cost
+            # partial runs; a result that only exists at the end of a four-hour
+            # job is a result that keeps not existing.
+            if options.out:
+                Path(options.out).parent.mkdir(parents=True, exist_ok=True)
+                Path(options.out).write_text(json.dumps(
+                    {"config": vars(options), "helm_params": helm_params,
+                     "euclid_params": euclid_params, "rows": rows,
+                     "complete": False}, indent=2))
             print(f"{name:7s} seed {seed}  ppl {ppl:8.2f}  top1 {row['top1']:6.2%}  "
                   f"brier1 {brier[0]:+.5f}  {per_step*1000:6.1f} ms/step  "
                   f"manifold_err {violation:.2e}", flush=True)
@@ -383,7 +392,8 @@ def main():
     if options.out:
         Path(options.out).write_text(json.dumps(
             {"config": vars(options), "helm_params": helm_params,
-             "euclid_params": euclid_params, "rows": rows}, indent=2))
+             "euclid_params": euclid_params, "rows": rows,
+             "complete": True}, indent=2))
         print(f"\nwrote {options.out}")
 
 
