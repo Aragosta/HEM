@@ -172,3 +172,120 @@ K-trend (averaging artefact), and, in the suite generally, BrierLM's geometric
 mean (reads 0.0000 for every model at byte level). In each case the invalidating
 quantity was already in the output. `MIN_LINKED`, the scrambled control and the
 per-order Brier reporting exist because of those, not in anticipation of them.
+
+## T0 — does HELM's advantage exist in a metric CALM could share?
+
+**The question.** HELM reports its advantage only as multiple-choice accuracy,
+scored by the harness picking the choice "with the highest likelihood value"
+(HELM, Appendix C.3), and reports **no perplexity anywhere**. CALM's head is an
+implicit sampler with no likelihood, so every number HELM reports is one a
+HELM-CALM cannot produce. Before building the integration, ask a cheaper
+question with no CALM in it: does HELM beat a matched Euclidean model on
+**perplexity**, a metric CALM can be compared on through BrierLM?
+
+**Setup.** WikiText-2 official splits, BPE-16000 trained on the train split
+(LLaMA-3.1's tokenizer is not fetchable here), 8.96M vs 9.03M parameters
+(+0.7%), 4000 steps = 2.58 epochs, seq 192, two seeds. Both arms **dense**
+(HELM-D via `n_dense_layers`, not MiCE) so the comparison is within an
+architecture family, as the paper's own comparisons are. Both arms **rotary**.
+HELM's manifold parameters under `RiemannianAdam` with 3% warmup, verified
+on-manifold throughout (`manifold_err` ~3e-07). **Each arm at its own swept
+learning-rate optimum**, both bracketed by interior minima over nine points.
+
+### Result
+
+| arm | seed | perplexity | top-1 | brier_1 | ms/step |
+| --- | --- | --- | --- | --- | --- |
+| HELM-D | 0 | 264.54 | 20.54% | +0.109 | 393.6 |
+| HELM-D | 1 | 273.75 | 20.00% | +0.063 | 451.8 |
+| Euclidean | 0 | **85.64** | **27.91%** | +0.172 | 276.9 |
+| Euclidean | 1 | **86.00** | **27.90%** | +0.109 | 273.6 |
+
+```
+perplexity   HELM 269.15 (sd 6.51)   Euclidean 85.82 (sd 0.26)
+             difference -183.32, i.e. 3.1x worse, at 28x the seed noise
+top-1        HELM 20.27%             Euclidean 27.91%   difference -7.64%
+```
+
+**HELM is worse on every shared metric**, by margins far outside seed noise.
+
+### The decile table is the interesting part
+
+Perplexity by token-frequency decile, 0 = most frequent, 9 = rarest:
+
+| decile | HELM | Euclidean | HELM worse by |
+| --- | --- | --- | --- |
+| 0 | 7.84 | 5.53 | 42% |
+| 1 | 6.69 | 5.31 | 26% |
+| 2 | 13.51 | 8.83 | 53% |
+| 3 | 38.71 | 18.39 | 111% |
+| 4 | 161.19 | 50.39 | 220% |
+| 5 | 797.55 | 174.76 | 356% |
+| 6 | 2366.21 | 394.98 | 499% |
+| 7 | 5855.37 | 969.26 | 504% |
+| 8 | 14822.78 | 2600.88 | 470% |
+| 9 | 42521.62 | 4214.11 | **909%** |
+
+**HELM is worse everywhere and monotonically worse toward the tail** — 42% on
+the most frequent decile, 909% on the rarest.
+
+That is the exact opposite of the claimed mechanism. HELM's own case study
+(Table 3) locates the geometry's contribution in the tail: generic words cluster
+at small norm, specific words at large norm, giving "better separation of
+long-tail tokens". Here the tail is where the hyperbolic model does worst.
+
+### Two readings, and the honest one is a mix
+
+**Reading A — the geometry does not help language modelling.** The advantage is
+absent on perplexity, and absent hardest where it is claimed to live.
+
+**Reading B — HELM is undertrained, and the geometry is why.** The two arms want
+learning rates **16x apart**: HELM's optimum is 2e-4 and it diverges above that
+under `RiemannianAdam`, while the Euclidean control's optimum is 3.2e-3. At 2.58
+epochs, being confined to a 16x lower rate means far less effective progress,
+and **rare tokens are exactly where undertraining shows first** because they are
+seen fewest times. The monotone tail degradation is the signature of an
+undertrained model, not necessarily of bad geometry.
+
+These are not alternatives so much as a chain: **the geometry imposes an
+optimization constraint, the constraint costs training progress, and the cost
+lands hardest in the tail.** On that reading the 3.1x is real but is a statement
+about hyperbolic *optimization* at this scale rather than about hyperbolic
+*representation*.
+
+### What this does and does not establish
+
+**Does not contradict HELM's paper.** HELM reports no perplexity. Its gains are
+1-2 points of near-chance multiple-choice accuracy (ARC-Challenge is *below*
+chance for every model in its Table 1; MMLU within a point of chance for all
+six). A model can be worse at next-token prediction and better at
+likelihood-ranked MCQ.
+
+**Scale.** 9M parameters on 6M tokens against the paper's 115M on 5B — roughly
+800x less data. A null at this scale is weaker evidence than a positive result
+would be.
+
+**Model.** This is HELM-D, not HELM-MiCE. The paper's headline model is the
+mixture-of-curvature version and it reports MiCE beating D. Making both arms
+dense was necessary for a family-matched comparison, and it costs HELM its best
+configuration.
+
+### Recommendation
+
+**Do not build HELM-CALM on the current evidence.** Not because the geometry is
+disproven, but because:
+
+1. the only metric a HELM-CALM could be evaluated on shows the geometry
+   **losing by 3.1x**, so there is nothing measurable for it to inherit;
+2. the benchmarks where HELM's advantage is established are likelihood-scored,
+   which CALM structurally cannot do;
+3. CALM's energy score allocates training signal in proportion to data density,
+   i.e. away from the tail — and the tail is both where HELM's mechanism is
+   claimed to act and where it is measurably weakest here.
+
+**What would change this**, in order of cost: rerun T0 with **HELM-MiCE against a
+Euclidean MoE** at 120M with a real tokenizer on 5B tokens, which is the paper's
+own setting; and report **BrierLM** there, since that is the one metric both a
+discrete and a continuous model can share. If HELM's advantage appears in
+BrierLM at that scale, the integration becomes measurable and worth building.
+Until then it is not.
