@@ -296,8 +296,14 @@ def main():
     print(f"HELM {helm_params:,} params ({budget.active:,} active/token)  vs  "
           f"Euclidean width {width} at {euclid_params:,} "
           f"({(euclid_params - helm_params) / helm_params:+.1%})")
-    print(f"lr: HELM (MoE) {options.lr:g}, Euclidean (dense) {options.lr_dense:g} "
-          f"-- HELM's own per-family protocol")
+    print(f"lr: HELM {options.lr:g}, Euclidean {options.lr_dense:g} -- each arm "
+          f"at its OWN swept optimum")
+    print("  established over 9 sweep points at 1200 steps, both bracketed:")
+    print("    HELM      1e-4 508.70 | 2e-4 466.06 | 4e-4 536.07")
+    print("    Euclidean 1.6e-3 129.63 | 3.2e-3 124.51 | 6.4e-3 157.33")
+    print("  the two optima differ by 16x, which is why every shared-grid "
+          "comparison\n  in this project was measuring the learning rate rather "
+          "than the geometry.")
 
     if options.lr_sweep or options.lr_sweep_helm:
         grids = {
