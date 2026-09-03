@@ -233,6 +233,14 @@ def main():
     parser.add_argument("--lr-dense", type=float, default=2e-4,
                         help="learning rate for the dense Euclidean arm")
     parser.add_argument("--seeds", default="0,1")
+    parser.add_argument("--lr-sweep-helm", default="",
+                        help="learning rates for the HELM arm, separate from the "
+                             "control's because the two prefer different ranges. "
+                             "Measured: under RiemannianAdam HELM improves "
+                             "monotonically toward LOWER rates while the "
+                             "Euclidean control improves toward HIGHER ones, so a "
+                             "single shared grid brackets neither optimum.")
+    parser.add_argument("--lr-sweep-euclid", default="")
     parser.add_argument("--lr-sweep", default="",
                         help="comma-separated learning rates; when set, each arm "
                              "is trained at every rate for --sweep-steps and the "
@@ -291,15 +299,20 @@ def main():
     print(f"lr: HELM (MoE) {options.lr:g}, Euclidean (dense) {options.lr_dense:g} "
           f"-- HELM's own per-family protocol")
 
-    if options.lr_sweep:
-        rates = [float(v) for v in options.lr_sweep.split(",")]
+    if options.lr_sweep or options.lr_sweep_helm:
+        grids = {
+            "helm": [float(v) for v in
+                     (options.lr_sweep_helm or options.lr_sweep).split(",")],
+            "euclid": [float(v) for v in
+                       (options.lr_sweep_euclid or options.lr_sweep).split(",")],
+        }
         sweep_cfg = dict(cfg, steps=options.sweep_steps)
         print(f"\nLR sweep at {options.sweep_steps} steps -- each arm judged at "
               f"its OWN best rate\n")
         print(f"{'arm':>8s} {'lr':>10s} {'val ppl':>10s}")
         best = {}
         for name in ("helm", "euclid"):
-            for rate in rates:
+            for rate in grids[name]:
                 stream = stream_from(train_ids, options.batch, options.seq_len,
                                      seed=0)
                 _, logits_fn, _, _, _ = train_arm(name, args, sweep_cfg, stream,
@@ -311,6 +324,20 @@ def main():
                     best[name] = (rate, ppl)
         print(f"\nbest: HELM {best['helm'][0]:.1e} (ppl {best['helm'][1]:.2f}), "
               f"Euclidean {best['euclid'][0]:.1e} (ppl {best['euclid'][1]:.2f})")
+        # A best point at the edge of its grid is the boundary of the search,
+        # not an optimum. Comparing two arms at unbracketed boundaries measures
+        # the grids rather than the architectures -- which is what the previous
+        # run was about to do, with HELM pinned at the bottom of the grid and the
+        # control at the top.
+        edge = [n for n in ("helm", "euclid")
+                if len(grids[n]) > 1
+                and best[n][0] in (min(grids[n]), max(grids[n]))]
+        if edge:
+            raise SystemExit(
+                f"\nSWEEP FAILED for {', '.join(edge)}: best rate sits at the "
+                f"edge of its grid, so the optimum is not bracketed. Widen it "
+                f"(--lr-sweep-helm / --lr-sweep-euclid) rather than comparing at "
+                f"a boundary.")
         options.lr, options.lr_dense = best["helm"][0], best["euclid"][0]
         print(f"proceeding with those rates\n")
 
