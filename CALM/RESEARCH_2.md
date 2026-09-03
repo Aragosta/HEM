@@ -1,5 +1,14 @@
 # What to test next, and whether HELM-CALM is worth it
 
+> **Correction (added after the first version).** This document originally leaned
+> on our -0.02% null as though it were weak evidence against a hyperbolic
+> advantage. It is not evidence at all, and for a sharper reason than scale.
+> HELM's published result is real: **HELM-MiCE consistently outperforms 1B
+> DeepSeek-V3, with gains up to 4% over the Euclidean architectures used in
+> LLaMA and DeepSeek** (NeurIPS 2025). See section 0.5 -- the advantage lives on
+> benchmarks we did not measure and, more importantly, on benchmarks a CALM
+> model may be unable to measure at all.
+
 A literature pass across hyperbolic deep learning, latent/patch language models,
 scoring rules, scaling methodology and representation geometry, plus two code
 measurements that came out of it. It ends with a ranked test plan and an honest
@@ -14,6 +23,44 @@ papers**, from three full codebases available locally (HELM, CALM, GM-VAE), and
 from two measurements run here. Source code is stronger evidence than an
 abstract; a synthesised search snippet is weaker than either. Claims below are
 marked accordingly.
+
+## 0.5 The metric, not just the scale, was wrong -- and this is the crux
+
+HELM's reported gains are on **MMLU and ARC**, and the paper's own framing is
+that HELM *"always achieve[s] higher accuracy on the more difficult reasoning
+benchmarks, namely MMLU and ARC-Challenging"*
+([HELM](https://arxiv.org/abs/2505.24722), NeurIPS 2025). The advantage is
+described as concentrated in the **harder** reasoning tasks, not spread
+uniformly.
+
+Our reproduction gate measured **bits-per-byte and next-byte accuracy**. Those
+are perplexity-family metrics. Nothing in HELM's claim says perplexity should
+move much, and a hyperbolic-vs-Euclidean tie on BPB is compatible with a 4% MMLU
+gain. **So the gate did not fail to reproduce HELM; it measured a quantity
+HELM's claim is not about.** That is a worse methodological error than running
+at 450K parameters, because more compute would not have fixed it.
+
+**And this is the crux for the integration.** MMLU and ARC are scored by
+comparing the **log-likelihood** of each candidate continuation. CALM has no
+likelihood -- that is the defining property of its implicit-sampler head, and
+the reason its own paper reports BrierLM instead of perplexity.
+
+So:
+
+* the benchmarks where HELM's advantage is established are **likelihood-based
+  multiple choice**;
+* a CALM model **cannot produce likelihoods**;
+* therefore **HELM-CALM cannot be evaluated on the evidence HELM's claim rests
+  on**, at least not in the form the claim was made.
+
+This is not a statement that the integration cannot work. It is a statement that
+we would have no way to tell whether it worked, using the measurement that made
+HELM credible in the first place. A generative workaround exists -- emit the
+answer letter and score exact match -- but it is noisier and is *not* how HELM's
+table was produced, so the comparison to that table would be broken.
+
+**Any serious plan has to solve the evaluation problem before the modelling
+problem.** That reorders the test plan in section 5.
 
 ## 1. The finding that best explains our null
 
@@ -145,7 +192,17 @@ used plain AdamW with a hard retraction and a hard radius clamp.
 
 ## 5. The test plan, ranked by information per GPU-hour
 
-**T1 — Is HELM's geometry doing anything? (CPU, ~1 hour, do this first)**
+**T0 — Fix the evaluation before anything else (design work, no compute)**
+HELM's advantage is established on likelihood-scored multiple choice, which CALM
+structurally cannot do (§0.5). Decide now which of these the project accepts:
+(a) evaluate HELM-CALM generatively on MMLU/ARC by emitting the answer and
+scoring exact match, accepting that it is not comparable to HELM's table;
+(b) restrict claims to BrierLM and generative benchmarks, and give up on
+comparing to HELM's published numbers; or (c) keep a likelihood-bearing head
+alongside the CALM head purely for evaluation. **Without one of these, no amount
+of GPU produces a number that speaks to HELM's claim.**
+
+**T1 — Is HELM's geometry doing anything? (CPU, ~1 hour, do this second)**
 Ablate the manifold from HELM piece by piece: replace `LorentzLinear` with plain
 `nn.Linear` (§1 says this is a no-op on the space part), then the Lorentzian
 attention inner product, then `LorentzRMSNorm`, then the manifold embedding.
@@ -183,8 +240,9 @@ integration has legs.
 
 ## 6. Is it worth it? An honest answer
 
-**The case against, and it is substantial.** Hyperbolic LLM work at scale
-reports performance **"comparable to Euclidean baselines"**, not better —
+**The case against, and it is substantial.** Multimodal hyperbolic work reports
+performance **"comparable to Euclidean baselines"** — though HELM itself does
+better than that, beating 1B DeepSeek-V3 by up to 4% on MMLU and ARC —
 compactness and uncertainty calibration are the claimed wins, not accuracy.
 Multi-token prediction already delivers CALM's efficiency with less machinery
 and *proven* quality gains at 13B. BLT already delivers byte-level patching at

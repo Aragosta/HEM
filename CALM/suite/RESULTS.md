@@ -53,6 +53,18 @@ from whether it predicts better, and this suite was not built to answer it.
 
 ### Why this is not evidence against HELM
 
+**Corrected, and the first reason is now the important one.** HELM's published
+result stands: HELM-MiCE consistently outperforms 1B DeepSeek-V3, with gains up
+to 4% over LLaMA/DeepSeek architectures, and it *"always achieve[s] higher
+accuracy on the more difficult reasoning benchmarks, namely MMLU and
+ARC-Challenging"*.
+
+**We measured the wrong quantity.** Bits-per-byte and next-byte accuracy are
+perplexity-family metrics. HELM's claim is about multiple-choice reasoning
+accuracy. A tie on BPB is entirely compatible with a 4% MMLU gain, so this table
+does not bear on HELM's claim at all -- and no amount of extra compute at this
+setup would have made it bear on it.
+
 Two reasons, and the second is a design mistake of mine rather than a limit of
 the hardware.
 
