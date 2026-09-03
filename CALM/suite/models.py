@@ -40,6 +40,29 @@ CELLS = ("helm_discrete", "euclid_discrete", "helm_calm", "euclid_calm")
 
 # --------------------------------------------------------- Euclidean backbone
 
+def rotary_table(dim: int, max_seq_len: int, theta: float = 10000.0) -> torch.Tensor:
+    """Standard RoPE frequencies, as complex numbers.
+
+    The control must use rotary encoding because HELM does (HOPE is a hyperbolic
+    rotary scheme). An earlier version of this control used learned absolute
+    position embeddings, which are a known step down from rotary for language
+    modelling -- so a quality gap between the arms would have been partly a
+    positional-encoding gap wearing a geometry label.
+    """
+    half = dim // 2
+    freqs = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32) / half))
+    angles = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), freqs)
+    return torch.polar(torch.ones_like(angles), angles)
+
+
+def apply_rotary(x: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """``(B, H, N, D)`` with D even; rotates pairs of channels."""
+    shape = x.shape
+    paired = torch.view_as_complex(x.float().reshape(*shape[:-1], -1, 2))
+    rotated = paired * table[: shape[-2]].view(1, 1, shape[-2], -1)
+    return torch.view_as_real(rotated).reshape(*shape).type_as(x)
+
+
 class EuclideanBackbone(nn.Module):
     """A pre-norm transformer, the control for the hyperbolic backbone.
 
@@ -64,11 +87,13 @@ class EuclideanBackbone(nn.Module):
             self.up = nn.Linear(dim, inter, bias=False)
             self.down = nn.Linear(inter, dim, bias=False)
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
+        def forward(self, x: torch.Tensor, rotary=None) -> torch.Tensor:
             b, n, d = x.shape
             q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
             shape = (b, n, self.heads, d // self.heads)
             q, k, v = (t.view(shape).transpose(1, 2) for t in (q, k, v))
+            if rotary is not None:
+                q, k = apply_rotary(q, rotary), apply_rotary(k, rotary)
             attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             x = x + self.out(attn.transpose(1, 2).reshape(b, n, d))
             h = self.norm2(x)
@@ -83,7 +108,18 @@ class EuclideanBackbone(nn.Module):
         self.dim = dim
         self.heads = heads
         self.embed = nn.Embedding(vocab_size, dim)
-        self.pos = nn.Parameter(torch.zeros(1, max_seq_len, dim))
+        head_dim = dim // heads
+        self.rotary = None
+        if head_dim % 2 == 0:
+            self.register_buffer("rotary_table",
+                                 rotary_table(head_dim, max_seq_len),
+                                 persistent=False)
+            self.rotary = True
+        else:
+            # Odd head dimension cannot carry complex pairs; fall back to a
+            # learned absolute encoding and say so, rather than silently
+            # comparing a rotary model against a non-rotary one.
+            self.pos = nn.Parameter(torch.zeros(1, max_seq_len, dim))
         self.layers = nn.ModuleList(
             [self.Layer(dim, heads, inter) for _ in range(layers)])
         self.norm = nn.RMSNorm(dim, eps=1e-5)
@@ -91,9 +127,13 @@ class EuclideanBackbone(nn.Module):
     def forward(self, x: torch.Tensor, embedded: bool = False) -> torch.Tensor:
         if not embedded:
             x = self.embed(x)
-        x = x + self.pos[:, :x.size(1)]
+        table = None
+        if self.rotary:
+            table = self.rotary_table
+        else:
+            x = x + self.pos[:, :x.size(1)]
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, table)
         return self.norm(x)
 
 
@@ -207,7 +247,8 @@ def helm_active_fraction(args) -> float:
 def match_euclidean_width(build_helm: Callable[[], nn.Module],
                           build_euclid: Callable[[int], nn.Module],
                           low: int = 16, high: int = 4096,
-                          tolerance: float = 0.02) -> Tuple[int, int, int]:
+                          tolerance: float = 0.02,
+                          multiple_of: int = 1) -> Tuple[int, int, int]:
     """Binary-search the Euclidean width that matches HELM's parameter count.
 
     Returns ``(width, euclidean_parameters, helm_parameters)``. Raises if no
@@ -217,15 +258,23 @@ def match_euclidean_width(build_helm: Callable[[], nn.Module],
     """
     target = count_parameters(build_helm())
     best = None
+    # Widths are snapped to a multiple so that `dim / heads` stays even and the
+    # control can actually use rotary encoding. Without this the search can land
+    # on a width whose only divisors force an odd head dimension -- width 202
+    # gives heads 2 and head_dim 101 -- and the control silently falls back to
+    # learned absolute position embeddings, reintroducing the very confound the
+    # rotary support was added to remove.
+    low = max(low // multiple_of, 1) * multiple_of
     while low <= high:
-        mid = (low + high) // 2
+        mid = ((low + high) // 2 // multiple_of) * multiple_of
+        mid = max(mid, multiple_of)
         count = count_parameters(build_euclid(mid))
         if best is None or abs(count - target) < abs(best[1] - target):
             best = (mid, count)
         if count < target:
-            low = mid + 1
+            low = mid + multiple_of
         elif count > target:
-            high = mid - 1
+            high = mid - multiple_of
         else:
             break
     width, count = best

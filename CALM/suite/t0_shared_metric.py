@@ -68,9 +68,18 @@ from models import (EuclideanDiscrete, build_helm_discrete,  # noqa: E402
 from tests._config import tiny_args  # noqa: E402
 
 
-def helm_args(vocab, dim, layers, heads, seq_len, batch):
+def helm_args(vocab, dim, layers, heads, seq_len, batch, dense=True):
+    """HELM config. ``dense=True`` makes every layer dense, i.e. HELM-D.
+
+    The paper compares like with like -- HELM-MiCE against DeepSeekV3 (both MoE)
+    and HELM-D against LLaMA (both dense). An earlier version of this script
+    compared HELM-MiCE (sparse, 9.79M active of 11.09M) against a dense
+    Euclidean model (11.06M active), which is a sparse-versus-dense comparison
+    wearing a geometry label. Dense on both sides removes that.
+    """
     head = max(((dim - 1) // heads) // 2 * 2 + 1, 5)
     return tiny_args(vocab_size=vocab, dim=dim, n_layers=layers, n_heads=heads,
+                     n_dense_layers=layers if dense else 1,
                      max_seq_len=seq_len, original_seq_len=seq_len,
                      max_batch_size=batch, qk_nope_head_dim=head,
                      qk_rope_head_dim=head, v_head_dim=head,
@@ -173,6 +182,17 @@ def main():
     parser.add_argument("--lr-dense", type=float, default=2e-4,
                         help="learning rate for the dense Euclidean arm")
     parser.add_argument("--seeds", default="0,1")
+    parser.add_argument("--lr-sweep", default="",
+                        help="comma-separated learning rates; when set, each arm "
+                             "is trained at every rate for --sweep-steps and the "
+                             "best per arm is reported. Comparing two arms at one "
+                             "shared rate, or at rates picked for other models, "
+                             "measures the rate as much as the architecture "
+                             "(arXiv:2608.11859).")
+    parser.add_argument("--sweep-steps", type=int, default=1200)
+    parser.add_argument("--sparse", action="store_true",
+                        help="use HELM-MiCE (sparse) instead of HELM-D (dense); "
+                             "only sound if the control is also MoE")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--eval-batches", type=int, default=24)
     parser.add_argument("--time-only", action="store_true")
@@ -188,12 +208,22 @@ def main():
     valid_ids = encode_split(tokenizer, "wikitext2", "valid")
     vocab = tokenizer.get_vocab_size()
     args = helm_args(vocab, options.dim, options.layers, options.heads,
-                     options.seq_len, options.batch)
+                     options.seq_len, options.batch, dense=not options.sparse)
 
     width, euclid_params, helm_params = match_euclidean_width(
         lambda: build_helm_discrete(args),
         lambda w: EuclideanDiscrete(vocab, w, options.layers, options.heads,
-                                    2 * w, options.seq_len))
+                                    2 * w, options.seq_len),
+        multiple_of=2 * options.heads)
+    probe = EuclideanDiscrete(vocab, width, options.layers, options.heads,
+                              2 * width, options.seq_len)
+    if not probe.backbone.rotary:
+        raise SystemExit(
+            f"control at width {width} could not use rotary encoding "
+            f"(heads {probe.backbone.heads}, head_dim "
+            f"{width // probe.backbone.heads}). HELM uses HOPE, a rotary scheme, "
+            f"so a non-rotary control would make the comparison a "
+            f"positional-encoding comparison. Adjust --dim or --heads.")
     budget = describe(build_helm_discrete(args), args, options.seq_len, is_helm=True)
 
     eval_batches = [b.to(device) for b in batches_from(
@@ -209,6 +239,29 @@ def main():
           f"({(euclid_params - helm_params) / helm_params:+.1%})")
     print(f"lr: HELM (MoE) {options.lr:g}, Euclidean (dense) {options.lr_dense:g} "
           f"-- HELM's own per-family protocol")
+
+    if options.lr_sweep:
+        rates = [float(v) for v in options.lr_sweep.split(",")]
+        sweep_cfg = dict(cfg, steps=options.sweep_steps)
+        print(f"\nLR sweep at {options.sweep_steps} steps -- each arm judged at "
+              f"its OWN best rate\n")
+        print(f"{'arm':>8s} {'lr':>10s} {'val ppl':>10s}")
+        best = {}
+        for name in ("helm", "euclid"):
+            for rate in rates:
+                stream = stream_from(train_ids, options.batch, options.seq_len,
+                                     seed=0)
+                _, logits_fn, _, _ = train_arm(name, args, sweep_cfg, stream, 0,
+                                               device, rate, width)
+                ppl, _ = perplexity_and_deciles(logits_fn, eval_batches[:8],
+                                                deciles)
+                print(f"{name:>8s} {rate:10.1e} {ppl:10.2f}", flush=True)
+                if name not in best or ppl < best[name][1]:
+                    best[name] = (rate, ppl)
+        print(f"\nbest: HELM {best['helm'][0]:.1e} (ppl {best['helm'][1]:.2f}), "
+              f"Euclidean {best['euclid'][0]:.1e} (ppl {best['euclid'][1]:.2f})")
+        options.lr, options.lr_dense = best["helm"][0], best["euclid"][0]
+        print(f"proceeding with those rates\n")
 
     if options.time_only:
         cfg = dict(cfg, steps=10)
