@@ -235,6 +235,18 @@ architectural intuition has.
 
 Ordered by cost, each falsifiable, each with a registered prediction:
 
+> **Implementation status.** C1 and C2 are built (`suite/hybrid.py`,
+> `suite/t2_criticality.py`): `beta_mode` makes the attention temperature a
+> per-head learnable scalar initialised so that step 0 is bit-identical to the
+> standard `1/sqrt(d)`, and `set_stats(True)` records the order parameters.
+> Measured at initialisation they read `entropy_norm = 1.0000`,
+> `participation_frac = 0.9997` -- a random model sits fully in the disordered
+> phase, as the theory requires. One trap found while building it: `AdamW`'s
+> weight decay applied to `log_beta` pulls it toward 0, i.e. beta toward 1.0,
+> which from a base of 0.25 is a 4x sharpening produced by the optimizer. That
+> would have made C2's prediction answer itself; decay is now restricted to
+> `ndim >= 2`. C3-C5 are not built.
+
 - **C1 — measure the order parameter (near-free).** Log per-layer, per-head
   attention entropy and the `Ω(h)` order parameter across the existing T0/T1
   runs. *Prediction:* the failing HELM arm from T0 (269 vs 86 perplexity) sits in
