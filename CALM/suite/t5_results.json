@@ -119,6 +119,19 @@
       "zero_frac": 0.0,
       "near_zero_frac": 0.3339266999391839,
       "gate_mass": 0.41904509416781366
+    },
+    {
+      "ffn": "dense",
+      "normalizer": "sigmoid",
+      "seed": 2,
+      "perplexity": 243.83813758656973,
+      "ms_per_step": 159.74473762512207,
+      "sparsity": 0.33159658743534237,
+      "participation": 33.11682391166687,
+      "participation_frac": 0.5381606593728065,
+      "zero_frac": 0.0,
+      "near_zero_frac": 0.33159658743534237,
+      "gate_mass": 0.46663221751805395
     }
   ]
 }
