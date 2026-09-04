@@ -26,6 +26,14 @@
       "perplexity": 230.19000811095867,
       "ms_per_step": 288.4218587875366,
       "params": 6135936
+    },
+    {
+      "head_dim": 16,
+      "geometry": "euclidean",
+      "seed": 1,
+      "perplexity": 230.27697753087926,
+      "ms_per_step": 292.79975843429565,
+      "params": 6135936
     }
   ]
 }
