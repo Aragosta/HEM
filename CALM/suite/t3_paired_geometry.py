@@ -192,8 +192,16 @@ def report(rows, head_dims):
         print(f"\n  pooled: mean {mean:+.2f} +- {stderr:.2f} (sem), "
               f"{sum(1 for d in everything if d > 0)}/{len(everything)} positive, "
               f"sign p = {sign_test_p(everything):.4f}")
-        print(f"  |mean| / sem = {abs(mean) / stderr:.1f}"
-              f"   (>2 is a resolved effect)")
+        # Report a proper t statistic against the right critical value.
+        # An earlier version printed "|mean|/sem > 2 is a resolved effect",
+        # which is the normal approximation; at n=6 the correct threshold is
+        # t(0.975, 5) = 2.571, and applying the loose rule would have declared
+        # head_dim 16 resolved at p = 0.081.
+        crit = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+                7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201}
+        df = len(everything) - 1
+        print(f"  t = {abs(mean) / stderr:.2f} on {df} df "
+              f"(two-sided 5% critical value {crit.get(df, 1.96):.3f})")
 
     print("\n  Interpretation guide, fixed in advance:")
     print("    - mean diff > 0 and sign p < 0.05  -> lorentz head geometry is")

@@ -403,3 +403,101 @@ sensitive than the loss at the same compute.
 
 The corollary for anything run next: **more seeds beat more steps.** Four to six
 seeds at 700 steps would resolve P1 and P2; two seeds at 2000 steps would not.
+
+---
+
+# T3 — euclidean vs Lorentz head geometry, PAIRED
+
+Same setup as T1/T2 (WikiText-2, BPE-16000, dim 192, 4 layers, kv_latent 48,
+seq 128, 500 steps, lr 3e-3), but the arms are compared **per seed** rather than
+by their means. The lift to the hyperboloid is a function, not a layer, so both
+arms have identical parameter names, shapes and values at a shared seed
+(6,135,936 each, verified bit-identical by `assert_paired`), see identical
+batches, and use no dropout. The per-seed difference therefore cancels the
+initialisation variance that made T1 and T2 unresolvable.
+
+| head_dim | seed | euclidean | lorentz | diff |
+|---|---|---|---|---|
+| 16 | 0 | 230.19 | 237.01 | +6.82 |
+| 16 | 1 | 230.28 | 236.28 | +6.00 |
+| 16 | 2 | 226.92 | 226.52 | −0.40 |
+| 16 | 3 | 231.30 | 230.77 | −0.52 |
+| 16 | 4 | 229.44 | 230.89 | +1.45 |
+| 16 | 5 | 226.71 | 230.25 | +3.54 |
+| 32 | 0 | 231.64 | 236.72 | +5.08 |
+| 32 | 1 | 232.20 | 235.91 | +3.71 |
+| 32 | 2 | 228.62 | 228.94 | +0.33 |
+| 32 | 3 | 233.78 | 238.00 | +4.22 |
+| 32 | 4 | 232.93 | 231.16 | −1.77 |
+| 32 | 5 | 231.23 | 232.66 | +1.44 |
+
+| | n | mean | p (paired t) | 95% CI | positive |
+|---|---|---|---|---|---|
+| head_dim 16 | 6 | +2.81 | 0.081 | [−0.50, +6.13] | 4/6 |
+| head_dim 32 | 6 | +2.17 | 0.099 | [−0.59, +4.93] | 5/6 |
+| **pooled** | 12 | **+2.49** | **0.010** | **[+0.72, +4.27]** | 9/12 |
+
+## Result 1 — a real ~1.1% penalty
+
+Lorentz head geometry costs **1.08% perplexity**, p = 0.010, CI excluding zero.
+This is the only architectural comparison in the suite that is both resolved
+and free of confounds: T0's effect was larger but its arms differed in
+optimizer and learning rate, while here the arms differ *only* in whether the
+attention score is a dot product or a Minkowski inner product.
+
+The sign test disagrees (9/12, p = 0.146), so the effect is carried by
+magnitude rather than consistency. Three seeds went the other way. The honest
+statement is "worse on average by ~1%, with individual runs varying in sign",
+not "reliably worse".
+
+## Result 2 — the mechanism is NOT dimension efficiency
+
+`WHY_HYPERBOLIC.md` predicted the hyperbolic effect should be largest at small
+head_dim and shrink as head_dim grows, because the FlyWire evidence puts the
+hyperbolic/Euclidean crossover at d=8-16. Measured: +2.81 at head_dim 16,
++2.17 at head_dim 32, **interaction p = 0.708**. Flat.
+
+Per the interpretation rule fixed before the run, a penalty flat in head_dim
+indicates a **fixed cost of the lift** — the time coordinate `sqrt(|x|^2 + c)`
+spending representational capacity on `|q|`, which the network already encodes
+— rather than a dimension-efficiency effect. The connectome argument does not
+transfer to attention.
+
+## What this settles
+
+With T0 (residual stream, 3.1x worse) this closes the line of enquiry:
+
+* hyperbolic geometry in the residual stream — large loss;
+* hyperbolic geometry in per-head attention space, the one regime
+  `WHY_HYPERBOLIC.md` identified as favourable — small but real loss, and the
+  predicted mechanism is absent.
+
+No configuration tested shows hyperbolic geometry helping. **Recommendation:
+stop pursuing the HELM side of the CALM-HELM integration.**
+
+## Caveats
+
+5M parameters, 500 steps (0.21 epochs), unswept lr 3e-3, WikiText-2, one seed
+family. A 1% effect at this scale could change sign at 120M parameters or at
+convergence, which is where HELM's own claims live. The flat head_dim trend is
+the more scale-robust half of the finding: it is evidence about *mechanism*,
+and it says the proposed mechanism is not operating.
+
+## Method note
+
+Three hypotheses died during this run, each with its falsification condition
+registered before the data that killed it:
+
+1. **bimodality** of the differences — died when seed 4 landed in the gap;
+2. **seed-correlation** across head_dims (r = 0.98 at n=3) — died when seed 3
+   inverted at head_dim 32, r falling to 0.60;
+3. **my own decision rule** `|mean|/sem > 2` — the normal approximation, wrong
+   at n=6 where the critical value is t(0.975,5) = 2.571. Applying it as
+   written would have declared head_dim 16 resolved at p = 0.081. Now fixed in
+   the script to print a t statistic against the correct critical value.
+
+The same discipline caught an earlier error in the opposite direction: the
+euclid/lorentz gap was dismissed as "0.7%, within noise" by comparing arm
+means, when four paired comparisons across four learning rates had already gone
+the same way. Pairing was available the whole time and would have made T1
+answerable at its original budget.
