@@ -1,0 +1,40 @@
+{
+  "config": {
+    "steps": 700,
+    "dim": 192,
+    "layers": 4,
+    "head_dim": 32,
+    "kv_latent": 48,
+    "seq_len": 128,
+    "batch": 8,
+    "vocab": 16000,
+    "lr": 0.003,
+    "top_k": 2,
+    "n_experts": 4,
+    "n_shared": 1,
+    "seeds": "0,1",
+    "device": "cpu",
+    "eval_batches": 16,
+    "stat_batches": 4,
+    "lr_sweep": "",
+    "sweep_steps": 800,
+    "time_only": false,
+    "out": "CALM/suite/t2_results.json"
+  },
+  "rows": [
+    {
+      "ffn": "dense",
+      "beta_mode": "fixed",
+      "seed": 0,
+      "perplexity": 194.41019374583442,
+      "ms_per_step": 213.68298939296176,
+      "params": 5248896,
+      "active_params": 5248896,
+      "participation": 12.418501883745193,
+      "participation_frac": 0.2172543010674417,
+      "entropy_norm": 0.4297085553407669,
+      "beta": 0.17677669529663687,
+      "beta_ratio": 1.0
+    }
+  ]
+}
