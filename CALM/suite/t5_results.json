@@ -93,6 +93,19 @@
       "entropy_norm": 0.5126139828935266,
       "beta": 0.17677669529663687,
       "beta_ratio": 1.0
+    },
+    {
+      "ffn": "dense",
+      "normalizer": "sigmoid",
+      "seed": 0,
+      "perplexity": 232.5755836415684,
+      "ms_per_step": 164.93752527236938,
+      "sparsity": 0.31688009458594024,
+      "participation": 33.740630745887756,
+      "participation_frac": 0.5392977595329285,
+      "zero_frac": 0.0,
+      "near_zero_frac": 0.31688009458594024,
+      "gate_mass": 0.41801297664642334
     }
   ]
 }
