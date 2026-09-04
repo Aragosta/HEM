@@ -501,3 +501,132 @@ euclid/lorentz gap was dismissed as "0.7%, within noise" by comparing arm
 means, when four paired comparisons across four learning rates had already gone
 the same way. Pairing was available the whole time and would have made T1
 answerable at its original budget.
+
+---
+
+# T5 — learned sparsity vs MHA and MoE MHA: does the MECHANISM matter?
+
+WikiText-2, BPE-16000, dim 192, 4 layers, head_dim 32, kv_latent 48, seq 128,
+500 steps, lr 3e-3. Three normalisers x two FFN types. softmax and sigmoid get
+6 seeds; alpha-entmax gets 3 (it costs 2.0-2.3x and is the control).
+
+Pairing verified at launch: within an FFN type all three arms share every weight
+tensor bit-identically (46 tensors dense, 98 MoE); the only extras are the
+per-head scalars `alpha_logit` / `gate_bias`.
+
+| arm | n | mean ppl | sd | part_frac | sparsity |
+|---|---|---|---|---|---|
+| dense/softmax | 6 | 233.47 | 3.48 | 0.2682 | — |
+| dense/sigmoid | 6 | 243.47 | 6.03 | 0.5526 | 0.2503 |
+| dense/entmax | 3 | 238.75 | 8.36 | 0.1032 | 0.8059 |
+| moe/softmax | 6 | 232.21 | 4.10 | 0.2882 | — |
+| moe/sigmoid | 6 | 241.79 | 6.18 | 0.5273 | 0.3829 |
+| moe/entmax | 3 | 233.42 | 6.57 | 0.1116 | 0.7862 |
+
+## Result 1 — every sparsity mechanism is worse, and softmax wins outright
+
+| paired contrast | n | mean | sd | t | crit | signs |
+|---|---|---|---|---|---|---|
+| dense/sigmoid vs softmax | 6 | **+9.99** | 3.38 | **+7.25** | 2.571 | 0/6 better |
+| moe/sigmoid vs softmax | 6 | **+9.58** | 7.66 | **+3.06** | 2.571 | 0/6 better |
+| dense/entmax vs softmax | 3 | +6.93 | 10.79 | +1.11 | 4.303 | 0/3 |
+| moe/entmax vs softmax | 3 | +1.25 | 9.32 | +0.23 | 4.303 | 2/3 |
+
+Sigmoid gating is **resolved worse** in both FFN types — ~+9.8 perplexity, about
+4%, with **12 of 12 individual seeds on the losing side**. entmax is directionally
+worse but never resolved, for reasons in Result 3.
+
+## Result 2 — P0 was wrong, and instructively so
+
+I predicted sigmoid would beat entmax, reasoning that a mechanism whose gradient
+never dies must beat one whose gradient does. **entmax came out better in both
+FFN types** (+0.89 dense, +4.75 moe, neither resolved).
+
+That reasoning was about *trainability* and ignored *representational cost*.
+Removing the simplex removes competition between keys, and the competition is
+load-bearing: softmax forces keys to trade off against one another, and without
+that the attention mass dilutes. The measurement is `participation_frac` 0.53
+for sigmoid against 0.27-0.29 for softmax — sigmoid drops 25-38% of keys outright
+and *still* attends about twice as broadly over what remains.
+
+**Sparsity and concentration are different axes.** No earlier experiment could
+express this: softmax cannot produce near-zeros at all, and T2's `beta` could
+only move concentration.
+
+So the ReLU objection was correct about entmax's gradients — verified directly,
+7 of 7 zeroed keys had gradient exactly 0 and 200 SGD steps of direct pressure
+could not revive one — but "avoid the dead gradient" was not sufficient guidance
+for choosing a replacement.
+
+## Result 3 — hard sparsity costs consistency, not mean quality
+
+The paired standard deviations:
+
+| | sigmoid | entmax |
+|---|---|---|
+| dense | 3.38 | **10.79** |
+| moe | 7.66 | **9.32** |
+
+entmax's spread is 1.2-3.2x sigmoid's, on half the sample. Its individual dense
+differences were +19.39, +0.25, +1.16 — one catastrophic run and two at parity.
+
+This is what an absorbing state predicts: whether a run lands well depends on
+which keys happen to die before the gradient vanishes, and that is seed-luck.
+**The dead gradient appears to cost variance rather than average quality** —
+entmax's mean is *better* than sigmoid's in both arms.
+
+Offered as the most likely reading, not as established: 3 seeds, and comparing
+standard deviations is statistically weak.
+
+## Result 4 — P2 holds at 6/6: learned sparsity drifts toward DENSITY
+
+alpha settled at 1.4838, 1.4732, 1.4755 (dense) and 1.4837, 1.4814, 1.4846
+(moe) — every run below the 1.5 initialisation.
+
+With T2's learned `beta` at 0.934x (flatter) and the 40-step probe at
+1.500 -> 1.490, that is **six measurements across two independent mechanisms,
+in two codebases, all showing autoregressive attention pushing back toward
+density when given a knob.** It also matches Correia et al.'s finding that
+decoder self-attention prefers denser attention than encoder self-attention.
+
+This is now the most robust result in the whole line of work.
+
+## Result 5 — P3 holds: no interaction with MoE routing
+
+The sigmoid penalty is +9.99 dense and +9.58 MoE — indistinguishable. Attention
+sparsity reduces the token-token graph and MoE routing reduces the token-expert
+graph; nothing connects them, and nothing in the data suggests otherwise. MoE
+load balance stayed healthy throughout (0.75-0.85, zero dead experts).
+
+## The honest limit (P4, registered before the run)
+
+Sparse attention's claimed mechanism is preventing attention **dispersion** at
+long context (`arXiv:2506.16640`): non-informative tokens accumulate mass as `n`
+grows, and exact zeros stop that accumulation. **At seq_len 128 there is almost
+no dispersion to prevent**, so this experiment tested sparsity where its
+mechanism cannot operate.
+
+The result therefore reads: *at short context, every sparsity mechanism tested
+costs perplexity, and every learnable sparsity knob is used to become less
+sparse.* It does **not** read "learned sparsity does not work".
+
+**The follow-up is the length axis, not more seeds**: paired softmax vs sigmoid
+vs entmax at seq_len 128 / 256 / 512, testing whether the penalty *shrinks* with
+length. That is a trend test like T3's head_dim sweep, and it is the only way to
+distinguish "sparsity does not help" from "we tested it where it cannot help".
+Attention cost scales as n^2, so seq 512 needs its own budget.
+
+## Method notes
+
+Two bugs caught before they reached a result:
+
+1. `near_zero_frac` counted causally masked positions as dropped keys, reporting
+   3.4605 for a quantity bounded in [0,1]. Fixed pre-launch.
+2. Mid-run I noted sigmoid's sparsity apparently falling across seeds and offered
+   two readings, committing to drop it if `gate_mass` explained it. It did:
+   r = -0.845, p = 0.034, while `participation_frac` stayed flat. A fixed 1e-3
+   threshold measures scale and reports it as structure. **Withdrawn.**
+
+One claim retracted mid-run: after row 13 the data looked like perplexity rising
+monotonically with sparsity. Row 14 killed it — 77% zeros for +0.25 perplexity,
+against 83% zeros for +19.39. It had been explicitly hedged to one seed.
