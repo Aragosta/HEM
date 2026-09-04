@@ -1,0 +1,33 @@
+{
+  "config": {
+    "steps": 500,
+    "dim": 192,
+    "layers": 4,
+    "head_dim": 32,
+    "kv_latent": 48,
+    "seq_len": 128,
+    "batch": 8,
+    "vocab": 16000,
+    "lr": 0.003,
+    "seeds": "0,1,2,3,4,5",
+    "entmax_seeds": "0,1,2",
+    "device": "cpu",
+    "eval_batches": 16,
+    "out": "CALM/suite/t5_results.json"
+  },
+  "rows": [
+    {
+      "ffn": "dense",
+      "normalizer": "softmax",
+      "seed": 0,
+      "perplexity": 228.26117865755472,
+      "ms_per_step": 156.72032022476196,
+      "sparsity": NaN,
+      "participation": 15.909044355154037,
+      "participation_frac": 0.27020871359854937,
+      "entropy_norm": 0.5030288435518742,
+      "beta": 0.17677669529663687,
+      "beta_ratio": 1.0
+    }
+  ]
+}
