@@ -84,6 +84,72 @@ independent codebases, both push autoregressive attention toward density.**
 That is now a real pattern rather than a one-off, and it is the most concrete
 prediction available to test.
 
+## 2b. The ReLU objection, and why it is correct
+
+`alpha-entmax` buys its exact zeros with a ReLU, and **a ReLU in the forward
+pass is a dead gradient in the backward pass.** The entmax Jacobian is
+
+    s_i = (p_i)^(2 - alpha)  if p_i > 0,   0  if p_i = 0
+
+so a key that has been zeroed receives *no gradient at all*. The model cannot
+learn "I should have attended to that token", because the signal that would
+teach it is identically zero. This is the dying-ReLU pathology transplanted
+into attention, and it is an **absorbing state**: hard sparsity is easy to
+enter and, along the direct path, impossible to leave.
+
+Measured here rather than assumed:
+
+* on a 12-key example at `alpha = 1.5`, **7 of 7 zeroed keys had gradient
+  exactly 0** -- including one the loss explicitly wanted to increase;
+* **200 SGD steps of direct pressure to revive a dead key moved it by nothing**,
+  in two separate regimes (rewarding the dead key alone, and additionally
+  pushing the surviving keys down).
+
+One honest qualification: inside a full transformer `z_i = q . k_i`, and `k_i`
+still receives gradient from *other* queries, so the key vector can drift back
+above threshold for unrelated reasons. The indirect path exists. But the direct
+learning signal for that (query, key) pair is gone, and the experiment above
+shows direct optimisation pressure cannot recover it.
+
+This reframes entmax's role in the design. It is no longer the candidate
+mechanism; it is the **negative control** — the arm that tells us whether the
+dead-gradient defect actually costs anything measurable.
+
+## 2c. Sparsity without a threshold
+
+If hard zeros are the problem, the fix is to get sparsity *without* a
+thresholding nonlinearity. Three candidates, in increasing order of machinery:
+
+**(a) Sigmoid attention** (`arXiv:2409.04431`). Drop the simplex entirely:
+each key gets an independent gate `sigmoid(q.k + b)`, with no normalisation and
+no competition between keys. Weights approach zero but never reach it, so the
+gradient never vanishes — measured minimum `|grad|` across keys was
+**1.5e-01**, against entmax's exact zeros. Sparsity becomes *soft and
+recoverable* rather than hard and absorbing. The bias must be initialised near
+`-log(n)`; without it the gate sum grows with sequence length and the residual
+stream blows up, which is the documented failure mode of unnormalised
+attention.
+
+**(b) Hard-concrete / L0 gates** (`arXiv:1712.01312`). Stochastic gates during
+training, so a *closed* gate still receives gradient through the sampling
+distribution and can reopen; deterministic at test time. This is the canonical
+fix for exactly this problem, and it comes with an explicit objective —
+`loss + lambda * E[L0]` — which is "learned sparsity optimising a metric" in
+the most literal sense, and yields a Pareto curve rather than a single point.
+
+**(c) Softmax plus a concentration objective.** Keep softmax, so support stays
+full and gradients reach every key, and add a loss term that *rewards*
+concentration — a penalty on the participation ratio, or on the distance from a
+target participation. Sparsity is then emergent and soft, and the target can be
+set from `CRITICALITY.md`'s operating point rather than pushed monotonically
+toward "sparser". No new kernel, no threshold, no dead units.
+
+(a) is the cheapest to test and the sharpest contrast with entmax: same
+question — should this key be attended to — answered by a mechanism whose
+gradient never dies. (c) is the most direct reading of "optimising some metric"
+and is nearly free to add. (b) is the most principled but needs the most new
+machinery, and is the right follow-up if (a) or (c) shows signal.
+
 ## 3. Where sparsity is actually supposed to help
 
 `Long-Context Generalization with Sparse Attention` (`arXiv:2506.16640`) gives
@@ -116,15 +182,20 @@ analogue, and is a natural follow-up if the attention result is positive.
 
 ## 5. Design
 
-### Arms: a 2x2, paired on the axis that can be paired
+### Arms: a 2x3, paired on the axis that can be paired
 
-|  | softmax attention | alpha-entmax attention |
-|---|---|---|
-| **dense FFN** | MHA baseline | learned-sparse MHA |
-| **MoE FFN** | MoE MHA baseline | learned-sparse MoE MHA |
+The design now tests **the mechanism of sparsification**, not merely "sparse
+versus dense", because the ReLU objection predicts that *how* sparsity is
+imposed matters more than *whether* it is:
 
-This answers the question directly: learned sparsity against both MHA and
-MoE MHA.
+|  | softmax | alpha-entmax | sigmoid gate |
+|---|---|---|---|
+| **dense FFN** | MHA baseline | hard sparsity (control) | soft sparsity |
+| **MoE FFN** | MoE MHA baseline | hard sparsity (control) | soft sparsity |
+
+This answers the original question — learned sparsity against both MHA and
+MoE MHA — and adds the contrast that the objection demands: two sparsity
+mechanisms that differ *only* in whether a zeroed key can come back.
 
 **Pairing.** Within a fixed FFN type, the softmax and entmax arms share every
 weight tensor bit-identically at a given seed (verified: 24 of 24 shared
@@ -151,9 +222,17 @@ Beyond perplexity, all already instrumented:
 
 ### Registered predictions
 
-**P1 (main, paired).** alpha-entmax gives parity or a small gain over softmax,
-not a large win. Basis: the source paper's own numbers are +0.11 BLEU on
-WMT14. **If we observe a large gain, be suspicious of a bug, not delighted.**
+**P0 (the new main test, paired).** Sigmoid gating beats alpha-entmax. Basis:
+they impose comparable sparsity, but entmax's zeros are an absorbing state with
+no direct gradient while sigmoid's gates always remain recoverable. If the two
+land together, the dead-gradient defect does not cost anything measurable at
+this scale and the ReLU objection — though correct in mechanism — is not
+load-bearing in practice. That is a genuinely useful negative result and the
+main reason to run entmax at all.
+
+**P1 (paired).** alpha-entmax gives parity or a small gain over softmax, not a
+large win. Basis: the source paper's own numbers are +0.11 BLEU on WMT14.
+**If we observe a large gain, be suspicious of a bug, not delighted.**
 
 **P2 (direction of alpha).** Learned `alpha` falls from its 1.5 initialisation
 toward 1 (denser). Basis: the paper's decoder finding, its early-training

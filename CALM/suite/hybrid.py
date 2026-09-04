@@ -47,7 +47,7 @@ from torch import nn
 
 GEOMETRIES = ("euclidean", "lorentz")
 BETA_MODES = ("fixed", "learned", "logn")
-NORMALIZERS = ("softmax", "entmax")
+NORMALIZERS = ("softmax", "entmax", "sigmoid")
 FFN_KINDS = ("dense", "moe")
 
 
@@ -164,9 +164,30 @@ class Attention(nn.Module):
         # Parameterised as alpha = 1 + sigmoid(a), one scalar per head, per
         # Correia, Niculae & Martins (arXiv:1909.00015), who derive the
         # Jacobian w.r.t. alpha that makes the sparsity level itself learnable.
+        # --- sigmoid attention: sparsity WITHOUT a threshold -----------------
+        # entmax buys exact zeros with a ReLU, and a ReLU in the forward pass
+        # is a dead gradient in the backward pass: the entmax Jacobian is
+        # s_i = (p_i)^(2-alpha) for p_i > 0 and exactly 0 otherwise, so a key
+        # that has been zeroed receives NO gradient. Measured here: 7 of 7
+        # zeroed keys had gradient exactly 0, and 200 SGD steps of direct
+        # pressure to revive one failed to move it at all.
+        #
+        # Sigmoid attention (arXiv:2409.04431) drops the simplex entirely:
+        # each key gets an independent gate sigmoid(score + b), with no
+        # normalisation and no competition. Weights approach zero but never
+        # reach it, so the gradient never vanishes -- measured min |grad| over
+        # keys was 1.5e-01. Sparsity becomes soft and recoverable rather than
+        # hard and absorbing.
+        #
+        # The bias is initialised at -log(n): without it the gate sum grows
+        # with sequence length and the residual stream blows up, which is the
+        # documented failure mode of unnormalised attention.
         self.normalizer = normalizer
         if normalizer == "entmax":
             self.alpha_logit = nn.Parameter(torch.full((heads, 1, 1), alpha_init))
+        elif normalizer == "sigmoid":
+            self.gate_bias = nn.Parameter(
+                torch.full((heads, 1, 1), -math.log(max(ref_len, 2))))
         self.collect_stats = False
         self.stats: dict = {}
 
@@ -229,13 +250,41 @@ class Attention(nn.Module):
         # broadcasts to a per-head temperature at no extra cost.
         q = q * self._scale(n)
 
-        if self.normalizer == "entmax":
+        if self.normalizer == "sigmoid":
+            out = self._attend_sigmoid(q, k, v, n)
+        elif self.normalizer == "entmax":
             out = self._attend_entmax(q, k, v, n)
         elif self.collect_stats:
             out = self._attend_with_stats(q, k, v, n)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0)
         return self.wo(out.transpose(1, 2).reshape(b, n, -1))
+
+    def _attend_sigmoid(self, q, k, v, n):
+        """Elementwise gated attention: no simplex, no threshold, no competition."""
+        scores = q @ k.transpose(-2, -1) + self.gate_bias
+        mask = torch.ones(n, n, dtype=torch.bool, device=q.device).triu(1)
+        p = torch.sigmoid(scores).masked_fill(mask, 0.0)
+
+        if self.collect_stats:
+            with torch.no_grad():
+                allowed = torch.arange(1, n + 1, device=q.device).float()
+                # p does not sum to 1 here, so normalise before computing the
+                # participation ratio -- otherwise the statistic is not
+                # comparable with the softmax and entmax arms.
+                pn = p / p.sum(-1, keepdim=True).clamp_min(1e-12)
+                part = 1.0 / pn.square().sum(-1).clamp_min(1e-12)
+                self.stats = {
+                    "participation": part[..., 1:].mean().item(),
+                    "participation_frac": (part[..., 1:] / allowed[1:]).mean().item(),
+                    "zero_frac": 0.0,          # soft: never exactly zero
+                    # Fraction of gates effectively off. The honest analogue of
+                    # entmax's zero_frac for a mechanism with no hard zeros.
+                    "near_zero_frac": ((p < 1e-3).float().sum(-1)[..., 1:]
+                                       / allowed[1:]).mean().item(),
+                    "gate_mass": p.sum(-1)[..., 1:].mean().item(),
+                }
+        return p @ v
 
     def alpha(self):
         return 1.0 + torch.sigmoid(self.alpha_logit)
