@@ -280,8 +280,12 @@ class Attention(nn.Module):
                     "zero_frac": 0.0,          # soft: never exactly zero
                     # Fraction of gates effectively off. The honest analogue of
                     # entmax's zero_frac for a mechanism with no hard zeros.
-                    "near_zero_frac": ((p < 1e-3).float().sum(-1)[..., 1:]
-                                       / allowed[1:]).mean().item(),
+                    # Causally masked positions are also 0 and must be excluded
+                    # or the "fraction" exceeds 1 -- a smoke test reported 3.46
+                    # before this subtraction.
+                    "near_zero_frac": (
+                        ((p < 1e-3).float().sum(-1)[..., 1:]
+                         - (n - allowed[1:])) / allowed[1:]).mean().item(),
                     "gate_mass": p.sum(-1)[..., 1:].mean().item(),
                 }
         return p @ v
