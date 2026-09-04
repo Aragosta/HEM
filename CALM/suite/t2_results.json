@@ -35,6 +35,20 @@
       "entropy_norm": 0.4297085553407669,
       "beta": 0.17677669529663687,
       "beta_ratio": 1.0
+    },
+    {
+      "ffn": "dense",
+      "beta_mode": "fixed",
+      "seed": 1,
+      "perplexity": 201.53608826116042,
+      "ms_per_step": 215.18736532756262,
+      "params": 5248896,
+      "active_params": 5248896,
+      "participation": 12.589114159345627,
+      "participation_frac": 0.21757269115187228,
+      "entropy_norm": 0.38968496583402157,
+      "beta": 0.17677669529663687,
+      "beta_ratio": 1.0
     }
   ]
 }
