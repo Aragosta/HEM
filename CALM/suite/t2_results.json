@@ -111,6 +111,23 @@
       "router_entropy_norm": 0.5412164367735386,
       "load_balance": 0.778162706643343,
       "dead_experts": 0.0
+    },
+    {
+      "ffn": "moe",
+      "beta_mode": "learned",
+      "seed": 0,
+      "perplexity": 198.04700900079015,
+      "ms_per_step": 299.060423714774,
+      "params": 6431640,
+      "active_params": 5251992,
+      "participation": 11.60791951417923,
+      "participation_frac": 0.2054376257583499,
+      "entropy_norm": 0.4242205200716853,
+      "beta": 0.16409315913915634,
+      "beta_ratio": 0.928251084588966,
+      "router_entropy_norm": 0.5151155516505241,
+      "load_balance": 0.8273998275399208,
+      "dead_experts": 0.0
     }
   ]
 }
