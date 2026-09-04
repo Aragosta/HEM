@@ -501,3 +501,106 @@ euclid/lorentz gap was dismissed as "0.7%, within noise" by comparing arm
 means, when four paired comparisons across four learning rates had already gone
 the same way. Pairing was available the whole time and would have made T1
 answerable at its original budget.
+
+---
+
+# T2-redux — was the temperature inert, or just redundant?
+
+WikiText-2, BPE-16000, dim 192, 4 layers, head_dim 32, kv_latent 48, seq 128,
+dense FFN, **500 steps, lr 3e-3, 4 seeds**, all four arms paired (25 of 25
+shared tensors bit-identical at each seed; the only extra parameter is
+`log_beta`). Script: `t2r_qknorm.py`, predictions registered in its docstring.
+
+T2 found a learnable per-head `beta` worth nothing and settling at 0.934x.
+`PHYSICS.md` sec.5.1 argued that experiment could not have concluded otherwise,
+because `hybrid.py` feeds `q` and `k` straight from their projections: the
+effective inverse temperature is `|q|*|k|*beta`, so `beta` was a redundant copy
+of a knob the weights already had. This run closes that route with QK-norm —
+RMS on `q` and `k` per head, no learnable gain, pinning `|q||k| = head_dim`.
+
+| arm | n | mean ppl | sd | beta_x | qk_gain | part_frac | entropy |
+|---|---|---|---|---|---|---|---|
+| raw/fixed | 4 | 232.80 | 3.92 | 1.000 | 51.840 | 0.2640 | 0.5230 |
+| raw/learned | 4 | 234.19 | 3.85 | 0.986 | 52.595 | 0.2729 | 0.5228 |
+| qknorm/fixed | 4 | 236.63 | 3.86 | 1.000 | 32.000 | 0.2729 | 0.7297 |
+| qknorm/learned | 4 | 239.48 | 11.23 | 1.110 | 32.000 | 0.2692 | 0.6975 |
+
+The four `raw/fixed` rows reproduce T5's dense/softmax column to the digit
+(228.26 / 230.81 / 236.37 / 235.76), so the harness is verified against an
+independent earlier run before any of this is read.
+
+## P1 — does closing the magnitude route make beta move? **Yes, cleanly.**
+
+| | beta_ratio | per seed |
+|---|---|---|
+| qk_norm off | 0.9860 ± 0.0085 | 0.9947, 0.9829, 0.9756, 0.9910 |
+| qk_norm on | 1.1100 ± 0.0434 | 1.1394, 1.1436, 1.0496, 1.1077 |
+
+Complete separation, in magnitude and in sign: every seed below 1.000 with the
+gain free, every seed above it with the gain pinned, and the departure from
+1.000 is **8x larger** (0.110 vs 0.014). The direction also inverts — free-gain
+`beta` drifts slightly flatter, as T2 found; pinned-gain `beta` goes ~11%
+*sharper*, which is the direction T2's original P2 predicted and could not see.
+
+**T2's null on temperature is an artefact of the parameterisation.** `beta` is
+not inert; it was a flat direction. Restoring it as the only route to logit
+scale gives it a reproducible, seed-stable optimum away from `1/sqrt(d)`.
+
+## P2 — does the q/k gain move to cancel beta? **No. Withdrawn.**
+
+Paired `d(qk_gain)` with qk_norm off: **+0.755 ± 7.236, 2 of 4 positive**
+(+0.392, −0.388, −7.281, +10.298). No signal, and the largest differences point
+both ways. With qk_norm on it is exactly 0.0000 in all four seeds, which
+verifies the instrument.
+
+So the *conclusion* of `PHYSICS.md` sec.5.1 survives (P1) but the *mechanism* it
+gave does not. Endpoint compensation is not what happens. The account the data
+supports is the weaker, more ordinary one: a redundant direction receives no
+consistent gradient, so `beta` simply never moves far; it does not need the
+weights to chase it.
+
+There is also a methodological finding here, and it is the useful part. The
+paired spread of `qk_gain` (± 7.2) is **larger** than its across-seed spread
+(sd ≈ 8 for the raw column: 55.6, 59.5, 51.8, 40.4). Pairing controls the
+initialisation, but a learnable `beta` perturbs the whole trajectory, so an
+endpoint quantity like the gain is not pinned the way perplexity is. Testing
+compensation properly means logging the gain *along* training, not at the end.
+
+## P3 — one operating point? **Only for participation, and only within a normaliser.**
+
+`participation_frac` is 0.264–0.273 in all four arms — the T2 attractor
+reading survives on that statistic. But `entropy_norm` splits by column: 0.52
+raw against 0.70–0.73 with QK-norm, a 40% difference at the same participation.
+
+T2 read the two as interchangeable views of one operating point. They are not.
+The same effective number of attended tokens is reached with a visibly
+different distribution shape, so "the model converges to its phase" is a claim
+about whichever statistic is being quoted, and future work has to name it.
+
+## P4 — perplexity. **Noise, as registered.**
+
+Paired `d(ppl)`: +1.39 ± 2.18 (qk_norm off), +2.85 ± 7.87 (on). Nothing.
+
+One unregistered effect *is* consistent, and it is the largest here: at fixed
+`beta`, QK-norm costs perplexity in **4 of 4 seeds** — +3.58, +4.49, +2.51,
++4.73, mean **+3.83 ± 1.00** on identical initialisations. Pinning `|q||k| = 32`
+holds the model in a flatter distribution (entropy 0.73 vs 0.52) than it reaches
+when free to grow the gain to 40–60, and it pays for that. Note also that
+`qknorm/learned` has by far the widest perplexity spread (sd 11.23, one seed at
+254.31): a free temperature with no magnitude route is the least stable of the
+four arms.
+
+## What this changes
+
+1. **T2's headline is withdrawn.** "A learnable temperature is worth nothing"
+   was measured on a parameterisation in which it could not have been worth
+   anything. The corrected statement: with the q/k magnitude free, `beta` is
+   redundant and does not move; with it pinned, `beta` moves reproducibly to
+   ~1.11x `1/sqrt(d)`.
+2. **The T0 re-opening argument is alive again, weakly.** C2 wanted a learnable
+   `beta` to test whether HELM's collapse was a temperature bug. T2 said that
+   route was worthless; it is not — but it only works alongside QK-norm, and
+   QK-norm itself costs ~3.8 perplexity here, so the test is more expensive than
+   C2 assumed.
+3. **Perplexity still cannot referee anything at this budget.** Every claim above
+   rests on the order parameters, as T2's own method note predicted it would.
