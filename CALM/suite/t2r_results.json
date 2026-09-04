@@ -1,0 +1,37 @@
+{
+  "config": {
+    "steps": 500,
+    "dim": 192,
+    "layers": 4,
+    "head_dim": 32,
+    "kv_latent": 48,
+    "seq_len": 128,
+    "batch": 8,
+    "vocab": 16000,
+    "lr": 0.003,
+    "seeds": "0,1,2,3",
+    "device": "cpu",
+    "eval_batches": 16,
+    "stat_batches": 4,
+    "time_only": false,
+    "out": "/home/user/HEM/CALM/suite/t2r_results.json"
+  },
+  "rows": [
+    {
+      "qk_norm": false,
+      "beta_mode": "fixed",
+      "seed": 0,
+      "perplexity": 228.26117865755472,
+      "ms_per_step": 216.98374271392822,
+      "participation": 15.909044355154037,
+      "participation_frac": 0.27020871359854937,
+      "entropy_norm": 0.5030288435518742,
+      "beta": 0.17677669529663687,
+      "beta_ratio": 1.0,
+      "q_norm": 11.16497454047203,
+      "k_norm": 4.603882804512978,
+      "qk_gain": 55.64032676147943,
+      "logit_gain": 9.835913090119359
+    }
+  ]
+}
