@@ -234,7 +234,15 @@ critical regimes from heavy-tailed weights), `arxiv:2507.08527`, `arxiv:2604.164
 Recorded because the corrections change what existing results mean. The first
 two are patched in `CRITICALITY.md`.
 
-**5.1 T2's `β` null is confounded, and the fix is three lines.** `hybrid.py`
+**5.1 T2's `β` null is confounded, and the fix is three lines.** *Tested in
+T2-redux; the conclusion holds and the mechanism given below does not — see
+`suite/RESULTS.md`. With QK-norm the learned `β` settles at 1.110 ± 0.043
+against 0.986 ± 0.009 without it, complete separation across four seeds, so the
+null was indeed an artefact of the parameterisation. But the paired q/k gain
+difference is +0.755 ± 7.236 with 2 of 4 signs positive: the endpoint
+compensation asserted below is **not observed**, and is withdrawn. What the data
+supports is the weaker claim that a redundant direction receives no consistent
+gradient, so `β` never moves far — it does not need the weights to chase it.* `hybrid.py`
 takes `q` and `k` straight from their linear projections (RoPE only, **no
 QK-norm**), so the effective inverse temperature is `‖q‖·‖k‖·β`. A learnable
 per-head `β` is then an exactly redundant copy of the q/k gain, and `RESULTS.md`
@@ -279,7 +287,8 @@ writer until it is restarted.
 
 ## 6. Experiments, cheapest first, with registered predictions
 
-**T2-redux — QK-norm × `β`, paired.** Fixes §5.1. Four arms: {QK-norm, none} ×
+**T2-redux — QK-norm × `β`, paired.** *Run: 4 arms × 4 seeds, verdict in
+`suite/RESULTS.md` — P1 holds, P2 fails, P3 splits, P4 noise.* Fixes §5.1. Four arms: {QK-norm, none} ×
 {fixed `β`, learned `β`}, paired at each seed as in T3.
 *Prediction:* with QK-norm, learned `β` moves substantially further from 1.0×
 than the 0.934× measured without it, because the compensating degree of freedom
