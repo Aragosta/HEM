@@ -64,9 +64,20 @@ def build(vocab, dim, layers, head_dim, kv_latent, head_geometry,
                          latent_geometry=latent_geometry, max_seq_len=seq_len)
 
 
-def train(model, stream, steps, lr, device, clip=1.0):
+def train(model, stream, steps, lr, device, clip=1.0, weight_decay=0.01):
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
+    # Weight decay on matrices only. Gains, biases and scalars are excluded --
+    # the standard convention, and here it is load-bearing rather than
+    # cosmetic: `log_beta` (the learned attention temperature) is a scalar
+    # initialised at log(1/sqrt(d)) = -1.386, so decaying it toward 0 would
+    # drive beta toward 1.0, a 4x sharpening produced by the optimizer rather
+    # than by learning. That would have made T2's "does beta move up?" question
+    # answer itself.
+    decayed = [p for p in params if p.ndim >= 2]
+    plain = [p for p in params if p.ndim < 2]
+    optimizer = torch.optim.AdamW(
+        [{"params": decayed, "weight_decay": weight_decay},
+         {"params": plain, "weight_decay": 0.0}], lr=lr)
     warmup = max(int(steps * 0.03), 1)
 
     def factor(step):
