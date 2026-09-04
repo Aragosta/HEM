@@ -47,6 +47,7 @@ from torch import nn
 
 GEOMETRIES = ("euclidean", "lorentz")
 BETA_MODES = ("fixed", "learned", "logn")
+NORMALIZERS = ("softmax", "entmax")
 FFN_KINDS = ("dense", "moe")
 
 
@@ -96,10 +97,13 @@ class Attention(nn.Module):
                  head_geometry: str = "euclidean",
                  latent_geometry: str = "euclidean",
                  curvature: float = 1.0, max_seq_len: int = 2048,
-                 beta_mode: str = "fixed", ref_len: int = 128):
+                 beta_mode: str = "fixed", ref_len: int = 128,
+                 normalizer: str = "softmax", alpha_init: float = 0.0):
         super().__init__()
         if beta_mode not in BETA_MODES:
             raise ValueError(f"beta_mode must be one of {BETA_MODES}, got {beta_mode!r}")
+        if normalizer not in NORMALIZERS:
+            raise ValueError(f"normalizer must be one of {NORMALIZERS}, got {normalizer!r}")
         for name, value in (("head_geometry", head_geometry),
                             ("latent_geometry", latent_geometry)):
             if value not in GEOMETRIES:
@@ -145,6 +149,24 @@ class Attention(nn.Module):
             # learned arm is bit-identical to the fixed arm.
             self.log_beta = nn.Parameter(
                 torch.full((heads, 1, 1), math.log(self.base_scale)))
+        # --- learned sparsity (alpha-entmax) --------------------------------
+        # alpha-entmax(z) = argmax_p <p,z> + H^T_alpha(p) over the simplex,
+        # with H^T the Tsallis entropy family. alpha = 1 recovers softmax
+        # exactly; alpha = 2 is sparsemax; alpha in (1,2) interpolates, and for
+        # every alpha > 1 the solution has EXACT ZEROS.
+        #
+        # This is the part `beta` could not reach. A temperature rescales the
+        # logits but softmax always has full support -- every token keeps a
+        # nonzero weight. alpha changes the *support*: it learns which tokens
+        # to drop. So T2's null result on beta says nothing about this; they
+        # are different mechanisms (temperature vs topology).
+        #
+        # Parameterised as alpha = 1 + sigmoid(a), one scalar per head, per
+        # Correia, Niculae & Martins (arXiv:1909.00015), who derive the
+        # Jacobian w.r.t. alpha that makes the sparsity level itself learnable.
+        self.normalizer = normalizer
+        if normalizer == "entmax":
+            self.alpha_logit = nn.Parameter(torch.full((heads, 1, 1), alpha_init))
         self.collect_stats = False
         self.stats: dict = {}
 
@@ -207,11 +229,46 @@ class Attention(nn.Module):
         # broadcasts to a per-head temperature at no extra cost.
         q = q * self._scale(n)
 
-        if self.collect_stats:
+        if self.normalizer == "entmax":
+            out = self._attend_entmax(q, k, v, n)
+        elif self.collect_stats:
             out = self._attend_with_stats(q, k, v, n)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0)
         return self.wo(out.transpose(1, 2).reshape(b, n, -1))
+
+    def alpha(self):
+        return 1.0 + torch.sigmoid(self.alpha_logit)
+
+    def _attend_entmax(self, q, k, v, n):
+        """alpha-entmax attention. No fused kernel exists, so this is explicit.
+
+        Masked positions are set to -inf before the transform, as with softmax;
+        entmax_bisect maps -inf to exactly zero weight, so causality holds.
+        """
+        from entmax import entmax_bisect
+        scores = q @ k.transpose(-2, -1)
+        mask = torch.ones(n, n, dtype=torch.bool, device=q.device).triu(1)
+        scores = scores.masked_fill(mask, float("-inf"))
+        alpha = self.alpha()
+        p = entmax_bisect(scores, alpha=alpha, dim=-1)
+
+        if self.collect_stats:
+            with torch.no_grad():
+                allowed = torch.arange(1, n + 1, device=q.device).float()
+                part = 1.0 / p.square().sum(-1).clamp_min(1e-12)
+                nonzero = (p > 0).float().sum(-1)
+                self.stats = {
+                    "participation": part[..., 1:].mean().item(),
+                    "participation_frac": (part[..., 1:] / allowed[1:]).mean().item(),
+                    # The quantity beta could not move: the fraction of
+                    # allowed keys that receive EXACTLY zero weight.
+                    "zero_frac": (1 - nonzero[..., 1:] / allowed[1:]).mean().item(),
+                    "alpha": alpha.mean().item(),
+                    "alpha_min": alpha.min().item(),
+                    "alpha_max": alpha.max().item(),
+                }
+        return p @ v
 
     def _attend_with_stats(self, q, k, v, n):
         """Explicit attention that also records the order parameters.
@@ -338,12 +395,14 @@ class Block(nn.Module):
     def __init__(self, dim, heads, head_dim, inter, kv_latent, head_geometry,
                  latent_geometry, max_seq_len, dense: bool,
                  beta_mode: str = "fixed", top_k: int = 2, n_experts: int = 4,
-                 n_shared: int = 1):
+                 n_shared: int = 1, normalizer: str = "softmax",
+                 alpha_init: float = 0.0):
         super().__init__()
         self.norm1 = nn.RMSNorm(dim, eps=1e-5)
         self.attn = Attention(dim, heads, head_dim, kv_latent, head_geometry,
                               latent_geometry, max_seq_len=max_seq_len,
-                              beta_mode=beta_mode, ref_len=max_seq_len)
+                              beta_mode=beta_mode, ref_len=max_seq_len,
+                              normalizer=normalizer, alpha_init=alpha_init)
         self.norm2 = nn.RMSNorm(dim, eps=1e-5)
         # FLOP-matched: the MoE arm activates top_k + n_shared experts of width
         # inter/(top_k + n_shared), so both arms do the same work per token and
@@ -367,7 +426,8 @@ class HybridDecoder(nn.Module):
                  latent_geometry: str = "euclidean",
                  max_seq_len: int = 512, n_dense: int = 1,
                  ffn: Optional[str] = None, beta_mode: str = "fixed",
-                 top_k: int = 2, n_experts: int = 4, n_shared: int = 1):
+                 top_k: int = 2, n_experts: int = 4, n_shared: int = 1,
+                 normalizer: str = "softmax", alpha_init: float = 0.0):
         super().__init__()
         if ffn is not None:
             if ffn not in FFN_KINDS:
@@ -382,7 +442,8 @@ class HybridDecoder(nn.Module):
             Block(dim, heads, head_dim, inter, kv_latent, head_geometry,
                   latent_geometry, max_seq_len, dense=(i < n_dense),
                   beta_mode=beta_mode, top_k=top_k, n_experts=n_experts,
-                  n_shared=n_shared)
+                  n_shared=n_shared, normalizer=normalizer,
+                  alpha_init=alpha_init)
             for i in range(layers)])
         self.norm = nn.RMSNorm(dim, eps=1e-5)
         self.head = nn.Linear(dim, vocab, bias=False)
