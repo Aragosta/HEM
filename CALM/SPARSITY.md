@@ -253,16 +253,35 @@ length".
 
 ### Budget
 
-Measured, uncontended, per 500-step run:
+Measured on an idle box (an earlier probe ran two jobs concurrently and
+produced an impossible ordering; those numbers are discarded):
 
-| arm | ms/step | 500 steps |
-|---|---|---|
-| dense / softmax | 196 | 1.6 min |
-| dense / entmax | 500 | 4.2 min |
-| moe / softmax | 237 | 2.0 min |
-| moe / entmax | 547 | 4.6 min |
+| ffn | attn | ms/step | 500 steps | vs softmax |
+|---|---|---|---|---|
+| dense | softmax | 159 | 1.3 min | 1.00x |
+| dense | entmax | 367 | 3.1 min | 2.30x |
+| dense | sigmoid | 159 | 1.3 min | **1.00x** |
+| moe | softmax | 204 | 1.7 min | 1.00x |
+| moe | entmax | 418 | 3.5 min | 2.05x |
+| moe | sigmoid | 196 | 1.6 min | **0.96x** |
 
-All four arms = 12.4 min per seed. **5 seeds = 62 min; 4 seeds = 50 min.**
+**Sigmoid gating is free** -- and marginally faster than softmax in the MoE arm,
+since it skips the softmax reduction entirely. entmax costs 2.0-2.3x for its
+bisection loop. So the threshold-free mechanism is cheaper in the forward pass
+*as well as* better behaved in the backward pass; entmax is paying a compute
+premium for the very property that kills its gradients.
+
+All six configurations initialise at loss ~9.706 against `ln(16000) = 9.68`, so
+no arm starts mis-conditioned.
+
+Per seed, all six arms: **12.5 min**. So 4 seeds = 50 min, 5 seeds = 62 min,
+6 seeds = 75 min.
+
+Note the allocation choice this exposes: entmax is 6.6 of those 12.5 minutes.
+Dropping it and running only softmax vs sigmoid would give **6 seeds in 18
+minutes**. Keeping entmax is a deliberate purchase of the P0 control -- whether
+the dead-gradient defect costs anything measurable -- at roughly triple the
+cost of the practical comparison alone.
 
 ### The follow-up that tests the mechanism
 
