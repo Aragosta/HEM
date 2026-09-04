@@ -1,0 +1,26 @@
+{
+  "config": {
+    "steps": 500,
+    "dim": 192,
+    "layers": 4,
+    "kv_latent": 48,
+    "seq_len": 128,
+    "batch": 8,
+    "vocab": 16000,
+    "lr": 0.003,
+    "head_dims": "16,32",
+    "seeds": "0,1,2,3,4,5",
+    "device": "cpu",
+    "eval_batches": 16,
+    "out": "CALM/suite/t3_results.json"
+  },
+  "rows": [
+    {
+      "head_dim": 16,
+      "seed": 0,
+      "euclidean": 230.19000811095867,
+      "lorentz": 237.00752111989843,
+      "diff": 6.8175130089397555
+    }
+  ]
+}
