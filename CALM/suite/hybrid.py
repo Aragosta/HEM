@@ -46,6 +46,8 @@ import torch.nn.functional as F
 from torch import nn
 
 GEOMETRIES = ("euclidean", "lorentz")
+BETA_MODES = ("fixed", "learned", "logn")
+FFN_KINDS = ("dense", "moe")
 
 
 def lift_to_hyperboloid(x: torch.Tensor, c: float = 1.0,
@@ -93,8 +95,11 @@ class Attention(nn.Module):
                  kv_latent: Optional[int] = None,
                  head_geometry: str = "euclidean",
                  latent_geometry: str = "euclidean",
-                 curvature: float = 1.0, max_seq_len: int = 2048):
+                 curvature: float = 1.0, max_seq_len: int = 2048,
+                 beta_mode: str = "fixed", ref_len: int = 128):
         super().__init__()
+        if beta_mode not in BETA_MODES:
+            raise ValueError(f"beta_mode must be one of {BETA_MODES}, got {beta_mode!r}")
         for name, value in (("head_geometry", head_geometry),
                             ("latent_geometry", latent_geometry)):
             if value not in GEOMETRIES:
@@ -120,6 +125,29 @@ class Attention(nn.Module):
             self.w_up_v = nn.Linear(up_in, inner, bias=False)
         self.wo = nn.Linear(inner, dim, bias=False)
 
+        # --- inverse temperature (CRITICALITY.md sec.1) ---------------------
+        # A score matrix passed through softmax is a dense graph annealed at
+        # inverse temperature beta. The default beta = 1/sqrt(d) is a variance
+        # argument, not an optimality argument, and the phase-transition result
+        # says the useful regime is a narrow band. So make beta a first-class
+        # knob instead of a constant folded into the kernel call.
+        #
+        # For the Lorentz arm the effective width is head_dim + 1, so the
+        # *default* beta already differs between geometries -- which is exactly
+        # the confound C1 suspects in T0. Making it learnable lets each arm find
+        # its own temperature rather than inheriting one from the other's algebra.
+        eff = head_dim + 1 if head_geometry == "lorentz" else head_dim
+        self.base_scale = 1.0 / math.sqrt(eff)
+        self.beta_mode, self.ref_len = beta_mode, ref_len
+        if beta_mode == "learned":
+            # One scalar per head, parameterised in log space so it stays
+            # positive. Initialised at the standard value, so at step 0 the
+            # learned arm is bit-identical to the fixed arm.
+            self.log_beta = nn.Parameter(
+                torch.full((heads, 1, 1), math.log(self.base_scale)))
+        self.collect_stats = False
+        self.stats: dict = {}
+
         # Rotary, applied in the *Euclidean* head coordinates before the lift.
         # Rotation is an isometry of the space part and leaves |q| unchanged, so
         # the time coordinate -- and hence the geometry -- is unaffected by it.
@@ -128,6 +156,17 @@ class Attention(nn.Module):
         angles = torch.outer(torch.arange(max_seq_len).float(), freqs)
         self.register_buffer("rotary", torch.polar(torch.ones_like(angles), angles),
                              persistent=False)
+
+    def _scale(self, n: int):
+        """Return the attention scale: a float, or a per-head tensor."""
+        if self.beta_mode == "learned":
+            return self.log_beta.exp()
+        if self.beta_mode == "logn":
+            # beta_n ~ log n (arXiv:2510.05554). Anchored so that at the
+            # training length this is exactly the standard scale -- it is
+            # therefore a no-op at fixed length and only bites on extrapolation.
+            return self.base_scale * math.log(max(n, 2)) / math.log(max(self.ref_len, 2))
+        return self.base_scale
 
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:
         if self.head_dim % 2:
@@ -161,12 +200,56 @@ class Attention(nn.Module):
             # 2c that separates them is invariant under softmax.
             q = lift_to_hyperboloid(q, self.c, negate_time=True)
             k = lift_to_hyperboloid(k, self.c)
-            scale = 1.0 / math.sqrt(self.head_dim + 1)
-        else:
-            scale = 1.0 / math.sqrt(self.head_dim)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+        # Fold beta into q rather than passing it to SDPA, because a learned
+        # beta is one scalar *per head* and SDPA's `scale` takes a float only.
+        # q is (b, heads, n, d) and log_beta is (heads, 1, 1), so this
+        # broadcasts to a per-head temperature at no extra cost.
+        q = q * self._scale(n)
+
+        if self.collect_stats:
+            out = self._attend_with_stats(q, k, v, n)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0)
         return self.wo(out.transpose(1, 2).reshape(b, n, -1))
+
+    def _attend_with_stats(self, q, k, v, n):
+        """Explicit attention that also records the order parameters.
+
+        Only ever called under `collect_stats`, i.e. at eval on a handful of
+        batches, so it does not need to be fast -- but it does need to compute
+        *exactly* what the fused path computes, or the diagnostics describe a
+        different model than the one being scored. Hence the same causal mask
+        and the same already-scaled q.
+        """
+        scores = q @ k.transpose(-2, -1)
+        mask = torch.ones(n, n, dtype=torch.bool, device=q.device).triu(1)
+        scores = scores.masked_fill(mask, float("-inf"))
+        p = scores.softmax(-1)
+
+        with torch.no_grad():
+            # Participation ratio 1 / sum(p^2): the *effective number of tokens
+            # attended*. This is the sharpest read on which phase a head is in.
+            # Near n -> disordered (uniform average, rank collapse); near 1 ->
+            # frozen (the identity/copy regime); in between is the useful phase.
+            allowed = torch.arange(1, n + 1, device=q.device).float()
+            part = 1.0 / p.square().sum(-1).clamp_min(1e-12)      # (b, h, n)
+            entropy = -(p * p.clamp_min(1e-12).log()).sum(-1)
+            # Normalise each position by its own maximum: position j may attend
+            # to j+1 keys, so max entropy is log(j+1). Position 0 has exactly
+            # one choice and is uninformative, so it is dropped rather than
+            # divided by log(1) = 0.
+            norm_ent = entropy[..., 1:] / allowed[1:].log()
+            self.stats = {
+                "participation": part[..., 1:].mean().item(),
+                "participation_frac": (part[..., 1:] / allowed[1:]).mean().item(),
+                "entropy_norm": norm_ent.mean().item(),
+                "beta": float(self._scale(n).mean()) if self.beta_mode == "learned"
+                        else float(self._scale(n)),
+                "beta_ratio": (float(self._scale(n).mean()) / self.base_scale
+                               if self.beta_mode == "learned" else 1.0),
+            }
+        return p @ v
 
 
 class MoE(nn.Module):
@@ -184,13 +267,23 @@ class MoE(nn.Module):
 
     def __init__(self, dim: int, inter: int, n_experts: int = 4, top_k: int = 2,
                  n_shared: int = 1):
+        """`inter` is the width of ONE expert, not the layer's total.
+
+        The caller is responsible for matching FLOPs: with `top_k + n_shared`
+        experts active per token, a dense FFN of width `W` is matched by experts
+        of width `W / (top_k + n_shared)`. `expert_width_for` does that
+        arithmetic so a comparison cannot silently drift into being a
+        capacity comparison instead of a routing comparison.
+        """
         super().__init__()
-        self.top_k = top_k
+        self.top_k, self.n_experts = top_k, n_experts
         self.router = nn.Linear(dim, n_experts, bias=False)
         self.experts = nn.ModuleList(
             [self.Expert(dim, inter) for _ in range(n_experts)])
         self.shared = nn.ModuleList(
             [self.Expert(dim, inter) for _ in range(n_shared)])
+        self.collect_stats = False
+        self.stats: dict = {}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, n, d = x.shape
@@ -207,19 +300,57 @@ class MoE(nn.Module):
                     out[mask] += weight[mask, slot, None] * expert(flat[mask])
         for expert in self.shared:
             out = out + expert(flat)
+
+        if self.collect_stats:
+            with torch.no_grad():
+                # Top-k routing is a *discrete* graph reduction over the expert
+                # graph, so it has its own order parameters. Router entropy says
+                # how close routing is to uniform (no reduction happening) or to
+                # a hard one-hot commitment; load imbalance is the collapse mode
+                # where reduction has gone too far and experts are dead.
+                ent = -(scores * scores.clamp_min(1e-12).log()).sum(-1).mean()
+                load = torch.zeros(self.n_experts, device=flat.device)
+                load.scatter_add_(0, index.reshape(-1),
+                                  torch.ones_like(index.reshape(-1),
+                                                  dtype=load.dtype))
+                load = load / load.sum().clamp_min(1)
+                self.stats = {
+                    "router_entropy_norm": (ent / math.log(self.n_experts)).item(),
+                    # 1 = perfectly balanced, 1/n_experts = fully collapsed.
+                    "load_balance": (1.0 / (self.n_experts
+                                            * load.square().sum())).item(),
+                    "dead_experts": int((load == 0).sum().item()),
+                }
         return out.reshape(b, n, d)
+
+
+def expert_width_for(dense_inter: int, top_k: int = 2, n_shared: int = 1) -> int:
+    """Expert width that makes an MoE layer FLOP-matched to a dense FFN.
+
+    Without this the usual MoE/dense comparison is confounded: the MoE arm gets
+    both a routing mechanism *and* more compute per token, and a win cannot be
+    attributed to either.
+    """
+    return max(1, round(dense_inter / (top_k + n_shared)))
 
 
 class Block(nn.Module):
     def __init__(self, dim, heads, head_dim, inter, kv_latent, head_geometry,
-                 latent_geometry, max_seq_len, dense: bool):
+                 latent_geometry, max_seq_len, dense: bool,
+                 beta_mode: str = "fixed", top_k: int = 2, n_experts: int = 4,
+                 n_shared: int = 1):
         super().__init__()
         self.norm1 = nn.RMSNorm(dim, eps=1e-5)
         self.attn = Attention(dim, heads, head_dim, kv_latent, head_geometry,
-                              latent_geometry, max_seq_len=max_seq_len)
+                              latent_geometry, max_seq_len=max_seq_len,
+                              beta_mode=beta_mode, ref_len=max_seq_len)
         self.norm2 = nn.RMSNorm(dim, eps=1e-5)
-        self.ffn = (MoE.Expert(dim, inter) if dense
-                    else MoE(dim, inter // 2))
+        # FLOP-matched: the MoE arm activates top_k + n_shared experts of width
+        # inter/(top_k + n_shared), so both arms do the same work per token and
+        # differ only in whether that work is routed.
+        self.ffn = (MoE.Expert(dim, inter) if dense else
+                    MoE(dim, expert_width_for(inter, top_k, n_shared),
+                        n_experts=n_experts, top_k=top_k, n_shared=n_shared))
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
@@ -234,13 +365,24 @@ class HybridDecoder(nn.Module):
                  kv_latent: Optional[int] = 64,
                  head_geometry: str = "euclidean",
                  latent_geometry: str = "euclidean",
-                 max_seq_len: int = 512, n_dense: int = 1):
+                 max_seq_len: int = 512, n_dense: int = 1,
+                 ffn: Optional[str] = None, beta_mode: str = "fixed",
+                 top_k: int = 2, n_experts: int = 4, n_shared: int = 1):
         super().__init__()
+        if ffn is not None:
+            if ffn not in FFN_KINDS:
+                raise ValueError(f"ffn must be one of {FFN_KINDS}, got {ffn!r}")
+            # `ffn` is the blunt switch used by the dense-vs-MoE comparison:
+            # every block is one kind or the other. `n_dense` (leading dense
+            # blocks, as in DeepSeek) stays available for anything else.
+            n_dense = layers if ffn == "dense" else 0
         inter = inter or 4 * dim
         self.embed = nn.Embedding(vocab, dim)
         self.blocks = nn.ModuleList([
             Block(dim, heads, head_dim, inter, kv_latent, head_geometry,
-                  latent_geometry, max_seq_len, dense=(i < n_dense))
+                  latent_geometry, max_seq_len, dense=(i < n_dense),
+                  beta_mode=beta_mode, top_k=top_k, n_experts=n_experts,
+                  n_shared=n_shared)
             for i in range(layers)])
         self.norm = nn.RMSNorm(dim, eps=1e-5)
         self.head = nn.Linear(dim, vocab, bias=False)
@@ -269,6 +411,28 @@ class HybridDecoder(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+
+    def set_stats(self, on: bool) -> None:
+        """Turn the order-parameter instrumentation on or off everywhere."""
+        for module in self.modules():
+            if isinstance(module, (Attention, MoE)):
+                module.collect_stats = on
+                if not on:
+                    module.stats = {}
+
+    def order_parameters(self) -> dict:
+        """Mean of each recorded statistic across layers, plus per-layer lists.
+
+        Call after a forward pass taken under `set_stats(True)`.
+        """
+        collected: dict = {}
+        for block in self.blocks:
+            for module in (block.attn, block.ffn):
+                for key, value in getattr(module, "stats", {}).items():
+                    collected.setdefault(key, []).append(value)
+        summary = {k: sum(v) / len(v) for k, v in collected.items()}
+        summary["per_layer"] = collected
+        return summary
 
     def logits(self, tokens: torch.Tensor) -> torch.Tensor:
         x = self.embed(tokens)
