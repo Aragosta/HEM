@@ -213,6 +213,22 @@
       "alpha": 1.4755313396453857,
       "alpha_min": 1.4626518189907074,
       "alpha_max": 1.4859232604503632
+    },
+    {
+      "ffn": "moe",
+      "normalizer": "softmax",
+      "seed": 0,
+      "perplexity": 234.0058482303784,
+      "ms_per_step": 217.55516815185547,
+      "sparsity": NaN,
+      "participation": 15.205045700073242,
+      "participation_frac": 0.26139473356306553,
+      "entropy_norm": 0.518566383048892,
+      "beta": 0.17677669529663687,
+      "beta_ratio": 1.0,
+      "router_entropy_norm": 0.5568059850484133,
+      "load_balance": 0.734310932457447,
+      "dead_experts": 0.0
     }
   ]
 }
