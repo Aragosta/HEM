@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 from pathlib import Path
@@ -201,8 +202,25 @@ def main():
         if options.out:
             Path(options.out).parent.mkdir(parents=True, exist_ok=True)
             Path(options.out).write_text(json.dumps(
-                {"config": vars(options), "rows": rows}, indent=2))
+                json_safe({"config": vars(options), "rows": rows}), indent=2))
     report(rows)
+
+
+def json_safe(value):
+    """Replace non-finite floats with None.
+
+    `sparsity` is NaN for the softmax arm -- it has no zeros to count, and that
+    is the correct value, not a missing one. But `json.dumps` writes a bare
+    `NaN`, which the JSON spec does not allow and strict parsers (`jq` among
+    them) refuse, making the results file unreadable by anything but Python.
+    """
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def report(rows):

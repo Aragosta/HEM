@@ -16,6 +16,9 @@ NEXT.md                what a proper HELM-CALM needs, and what could kill it
 HIERARCHY.md           the hierarchy test: attempted, and why it did not work
 DID_IT_WORK.md         did it work? faithful implementation, uncompetitive model
 PARKED.md              the end-to-end efficiency benchmark, specified but unrun
+CRITICALITY.md         attention as a graph with a temperature: the physics reading
+SPARSITY.md            learned attention sparsity: research and the T5 design
+PHYSICS.md             physics and neuroscience for a Kimi-shaped model, and a mistakes register
 ```
 
 **Status:** Stages 0, 1 and the 2a/2b/2c pre-checks all pass — see `RESULTS.md`. CALM's autoencoder is

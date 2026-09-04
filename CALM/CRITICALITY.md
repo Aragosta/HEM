@@ -45,24 +45,56 @@ Related: `arxiv:2605.08505` gives a critical scale `β_n* ~ n^{2/(d−1)}` in a
 different asymptotic regime — note the **explicit dependence on head dimension
 `d`**. `arxiv:2303.06296` shows attention-entropy collapse coincides with
 training instability (entropy is exactly the order parameter you would pick).
-`arxiv:2601.19942` gives an order parameter `Ω(h) = 1 − ‖h‖₁/(√d‖h‖₂)` that is
-discontinuous at a critical depth. `arxiv:2512.01868` treats attention as an
-interacting particle system with Kuramoto-style synchronisation.
+The order parameter `Ω(h) = 1 − ‖h‖₁/(√d‖h‖₂)` is the **Hoyer sparsity
+measure** (Hoyer 2004), a monotone reparameterisation of the inverse
+participation ratio this repo already logs as `participation_frac`; an earlier
+draft of this document attributed it to `arxiv:2601.19942`, which is a weak
+source and not needed for a 2004 result. `arxiv:2512.01868` treats attention as
+an interacting particle system with Kuramoto-style synchronisation.
 `arxiv:2606.12058` finds copy-head emergence is itself a phase transition.
 
 **The reduction is already happening.** Softmax does not select edges, it
-anneals them. "Sparsifying attention" and "operating at criticality" are the
-same operation viewed from two disciplines.
+anneals them: `β` moves how concentrated the weights are, never which keys are
+in the distribution.
+
+> **Correction.** An earlier version of this paragraph continued: *"sparsifying
+> attention" and "operating at criticality" are the same operation viewed from
+> two disciplines.* That is wrong, and `SPARSITY.md` §1 is right — concentration
+> and topology are different objects, softmax has full support at every finite
+> `β`, and T2's null on temperature is therefore not evidence about sparsity.
+> The defensible claim is the weaker one: **softmax attention has a control
+> parameter with a known critical scaling, and that parameter is not the same
+> knob as edge membership.**
 
 ### What this repo can test
 
-The T1 sweep currently running varies `head_dim ∈ {16, 32, 64}` at fixed total
-width 192. Since `β = 1/√d_head`, that sweep is *also* a sweep of inverse
-temperature — 0.25, 0.177, 0.125. It was designed to test dimension efficiency
-of hyperbolic heads; it doubles as a coarse scan of the `β` axis. A follow-up
-that decouples them (fix `head_dim`, learn or schedule a per-head `β`, and log
-attention entropy per layer) would separate "geometry helps" from "temperature
-was mis-set", which the current design cannot.
+The T1 sweep varies `head_dim ∈ {16, 32, 64}` at fixed total width 192, which
+also moves `β = 1/√d_head` across 0.25, 0.177, 0.125.
+
+> **Correction.** An earlier version called that "a coarse scan of the `β` axis".
+> It is not, for two reasons. (a) At fixed width the knob moves three things at
+> once — `β`, the per-head subspace dimension, and the head count (12 / 6 / 3) —
+> so no arm is a controlled change in temperature. (b) The critical scaling in
+> `arxiv:2510.05554` is in **`n`**, the context length: `β_n ≍ log n`. T1 holds
+> `n = 128` fixed in every arm, so it does not vary the parameter the theorem
+> identifies at all. The head-dimension dependence is a different asymptotic
+> regime (`arxiv:2605.08505`) and is not the result being cited here.
+
+Separating the axes needs a design that fixes `head_dim`, varies `β` directly,
+and — see the T2 note below — removes the q/k gain that `β` is otherwise
+redundant with.
+
+> **What T2 then measured, and did not measure.** T2 made `β` a learnable
+> per-head scalar and found it worth no perplexity, settling at 0.934× in four
+> independent runs. But `hybrid.py` takes `q` and `k` straight from their linear
+> projections (RoPE only, no QK-norm), so the effective inverse temperature is
+> `‖q‖·‖k‖·β` and a per-head `β` is an exactly redundant copy of the q/k gain.
+> `RESULTS.md` measured the compensation happening — flatter `β`, yet a *more*
+> concentrated final operating point. So T2's null says "a redundant
+> parameterisation buys nothing", which is close to a tautology, and not
+> "temperature does not matter". The decisive rerun applies QK-norm (per-head L2
+> or RMS on `q` and `k`), which deletes the compensating degree of freedom and
+> makes `β` the only route to the operating point. See `PHYSICS.md` §5.
 
 ---
 
@@ -207,9 +239,20 @@ critical point you want to approach but not cross.
 Stacking the four literatures:
 
 1. A transformer layer is a **dense graph** (attention) plus a **discrete graph
-   reduction** (MoE top-k routing — which is exactly a hard, learned, sparse
-   edge selection over the expert graph, and nobody in the criticality
-   literature seems to have noticed).
+   reduction** (MoE top-k routing — a hard, learned, sparse edge selection over
+   the expert graph).
+
+   > **Correction.** An earlier version added "and nobody in the criticality
+   > literature seems to have noticed". That is no longer true:
+   > `arxiv:2605.06415` builds a dimensionless control parameter
+   > `E = T·H/(O+B)` and reports a threshold `E ≥ 0.5` above which no expert
+   > dies — a phase diagram for expert ecology; `arxiv:2605.17598` measures
+   > deep-layer routing collapse by usage entropy in production MoEs;
+   > `arxiv:2512.03915` casts DeepSeek's auxiliary-loss-free balancing as a
+   > primal-dual method. What is still unclaimed is narrower: treating the
+   > router as a **homeostatic controller with a measured critical point**, and
+   > running branching/avalanche statistics on the expert graph. See
+   > `PHYSICS.md` §3.
 2. The dense graph is already continuously sparsified by `β`, with a **known
    critical scaling** `β_n ≍ log n` and three phases, the useful one being an
    intermediate regime of content-adaptive sparsity (§1).
@@ -265,6 +308,11 @@ Ordered by cost, each falsifiable, each with a registered prediction:
   activity-based add/delete rule over the expert graph (§5), targeting a measured
   criticality statistic rather than a fixed k. *Prediction:* matches top-k at
   equal average sparsity but is more robust to the expert-collapse failure mode.
+  **Caveat added later:** the suite's 4-expert / top-2 configuration cannot test
+  this. `load_balance` has a collapse floor of 0.25 there and `dead_experts` is a
+  0-to-4 count, while the failure modes this is aimed at appear at Kimi K3's
+  16-of-896 (sparsity 56), which is why K3 needed Quantile Balancing at all.
+  C4 needs the expert count raised before it means anything.
 - **C5 — dense-then-prune schedule.** Train dense, prune toward the critical
   sparsity of §4. *Prediction:* per `arxiv:1806.01878`, the dense transient is
   necessary; a matched-FLOP always-sparse run underperforms.
