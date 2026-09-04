@@ -171,6 +171,20 @@
       "zero_frac": 0.0,
       "near_zero_frac": 0.18619423045311123,
       "gate_mass": 0.4896072130650282
+    },
+    {
+      "ffn": "dense",
+      "normalizer": "entmax",
+      "seed": 0,
+      "perplexity": 247.646778726335,
+      "ms_per_step": 391.8852300643921,
+      "sparsity": 0.829544298350811,
+      "participation": 3.489914208650589,
+      "participation_frac": 0.08827999630011618,
+      "zero_frac": 0.829544298350811,
+      "alpha": 1.4838202893733978,
+      "alpha_min": 1.475691944360733,
+      "alpha_max": 1.493294507265091
     }
   ]
 }
