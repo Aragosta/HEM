@@ -98,7 +98,8 @@ class Attention(nn.Module):
                  latent_geometry: str = "euclidean",
                  curvature: float = 1.0, max_seq_len: int = 2048,
                  beta_mode: str = "fixed", ref_len: int = 128,
-                 normalizer: str = "softmax", alpha_init: float = 0.0):
+                 normalizer: str = "softmax", alpha_init: float = 0.0,
+                 qk_norm: bool = False):
         super().__init__()
         if beta_mode not in BETA_MODES:
             raise ValueError(f"beta_mode must be one of {BETA_MODES}, got {beta_mode!r}")
@@ -143,6 +144,24 @@ class Attention(nn.Module):
         eff = head_dim + 1 if head_geometry == "lorentz" else head_dim
         self.base_scale = 1.0 / math.sqrt(eff)
         self.beta_mode, self.ref_len = beta_mode, ref_len
+        # --- QK-norm: removing the knob beta is redundant with --------------
+        # Without this, the effective inverse temperature is |q|*|k|*beta, and
+        # the q/k projections can rescale to undo any change beta makes -- which
+        # is what T2 measured happening (beta settled 7% flatter while the final
+        # attention got *more* concentrated, not less). A learnable beta is then
+        # a redundant copy of an existing degree of freedom, and its null result
+        # says nothing about temperature.
+        #
+        # RMS-normalising q and k per head fixes |q| = |k| = sqrt(head_dim)
+        # exactly, so the logit is head_dim * cos(q,k) * beta and the *only*
+        # routes to a sharper distribution are the angle and beta. There is
+        # deliberately no learnable gain here: a learnable per-channel scale
+        # would put the compensating degree of freedom straight back.
+        #
+        # This is also what production models do -- K3 L2-normalises q and k
+        # inside KDA, and K2 needed MuonClip/QK-clip -- precisely because logit
+        # scale is otherwise uncontrolled.
+        self.qk_norm = qk_norm
         if beta_mode == "learned":
             # One scalar per head, parameterised in log space so it stays
             # positive. Initialised at the standard value, so at step 0 the
@@ -234,6 +253,10 @@ class Attention(nn.Module):
             k = self.w_up_k(latent).view(shape).transpose(1, 2)
             v = self.w_up_v(latent).view(shape).transpose(1, 2)
 
+        if self.qk_norm:
+            q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-6)
+            k = k * torch.rsqrt(k.square().mean(-1, keepdim=True) + 1e-6)
+
         q, k = self._rotate(q), self._rotate(k)
 
         if self.head_geometry == "lorentz":
@@ -248,6 +271,14 @@ class Attention(nn.Module):
         # beta is one scalar *per head* and SDPA's `scale` takes a float only.
         # q is (b, heads, n, d) and log_beta is (heads, 1, 1), so this
         # broadcasts to a per-head temperature at no extra cost.
+        gain = None
+        if self.collect_stats:
+            with torch.no_grad():
+                # |q| and |k| *before* beta is applied. Their product is the
+                # part of the logit scale that beta does not control, and the
+                # direct evidence for whether compensation is available.
+                gain = (q.norm(dim=-1).mean().item(), k.norm(dim=-1).mean().item())
+
         q = q * self._scale(n)
 
         if self.normalizer == "sigmoid":
@@ -258,6 +289,14 @@ class Attention(nn.Module):
             out = self._attend_with_stats(q, k, v, n)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0)
+        if gain is not None:
+            with torch.no_grad():
+                scale = self._scale(n)
+                scale = (float(scale.mean()) if torch.is_tensor(scale)
+                         else float(scale))
+            self.stats.update({"q_norm": gain[0], "k_norm": gain[1],
+                               "qk_gain": gain[0] * gain[1],
+                               "logit_gain": gain[0] * gain[1] * scale})
         return self.wo(out.transpose(1, 2).reshape(b, n, -1))
 
     def _attend_sigmoid(self, q, k, v, n):
@@ -449,13 +488,14 @@ class Block(nn.Module):
                  latent_geometry, max_seq_len, dense: bool,
                  beta_mode: str = "fixed", top_k: int = 2, n_experts: int = 4,
                  n_shared: int = 1, normalizer: str = "softmax",
-                 alpha_init: float = 0.0):
+                 alpha_init: float = 0.0, qk_norm: bool = False):
         super().__init__()
         self.norm1 = nn.RMSNorm(dim, eps=1e-5)
         self.attn = Attention(dim, heads, head_dim, kv_latent, head_geometry,
                               latent_geometry, max_seq_len=max_seq_len,
                               beta_mode=beta_mode, ref_len=max_seq_len,
-                              normalizer=normalizer, alpha_init=alpha_init)
+                              normalizer=normalizer, alpha_init=alpha_init,
+                              qk_norm=qk_norm)
         self.norm2 = nn.RMSNorm(dim, eps=1e-5)
         # FLOP-matched: the MoE arm activates top_k + n_shared experts of width
         # inter/(top_k + n_shared), so both arms do the same work per token and
@@ -480,7 +520,8 @@ class HybridDecoder(nn.Module):
                  max_seq_len: int = 512, n_dense: int = 1,
                  ffn: Optional[str] = None, beta_mode: str = "fixed",
                  top_k: int = 2, n_experts: int = 4, n_shared: int = 1,
-                 normalizer: str = "softmax", alpha_init: float = 0.0):
+                 normalizer: str = "softmax", alpha_init: float = 0.0,
+                 qk_norm: bool = False):
         super().__init__()
         if ffn is not None:
             if ffn not in FFN_KINDS:
@@ -496,7 +537,7 @@ class HybridDecoder(nn.Module):
                   latent_geometry, max_seq_len, dense=(i < n_dense),
                   beta_mode=beta_mode, top_k=top_k, n_experts=n_experts,
                   n_shared=n_shared, normalizer=normalizer,
-                  alpha_init=alpha_init)
+                  alpha_init=alpha_init, qk_norm=qk_norm)
             for i in range(layers)])
         self.norm = nn.RMSNorm(dim, eps=1e-5)
         self.head = nn.Linear(dim, vocab, bias=False)
