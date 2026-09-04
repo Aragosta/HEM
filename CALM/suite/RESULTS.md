@@ -289,3 +289,117 @@ own setting; and report **BrierLM** there, since that is the one metric both a
 discrete and a continuous model can share. If HELM's advantage appears in
 BrierLM at that scale, the integration becomes measurable and worth building.
 Until then it is not.
+
+---
+
+# T2 — dense MHA vs MoE MHA, and is `1/sqrt(d)` the right temperature?
+
+WikiText-2, BPE-16000, dim 192, 4 layers, head_dim 32, kv_latent 48, seq 128,
+**700 steps (0.30 epochs), 2 seeds**, lr 3e-3.
+
+**Read the caveat before the numbers.** This run was capped at one hour. The
+learning rate was **not swept** — 3e-3 is an extrapolation from a grid that
+never bracketed its optimum — and 700 steps is a third of an epoch. The seed
+standard deviation is 1.5–5.0 perplexity while the entire spread between arms
+is 1.6. Every perplexity comparison below is therefore inside the noise, and
+none of them should be quoted as a result.
+
+| arm | seed 0 | seed 1 | mean | seed sd | total params | active |
+|---|---|---|---|---|---|---|
+| dense/fixed | 194.41 | 201.54 | 197.97 | 5.04 | 5,248,896 | 5,248,896 |
+| dense/learned | 196.17 | 198.35 | 197.26 | 1.54 | 5,248,920 | 5,248,920 |
+| moe/fixed | 199.59 | 193.15 | 196.37 | 4.55 | 6,431,616 | 5,251,968 |
+| moe/learned | 198.05 | 194.69 | 196.37 | 2.38 | 6,431,640 | 5,251,992 |
+
+Active parameters differ by 0.06% (the router) against a 22% difference in
+total parameters, so the FFN comparison is FLOP-matched as intended.
+
+## P1 — routing at matched FLOPs: **not resolvable**
+
+MoE wins the mean by 0.81% (fixed beta) and 0.45% (learned beta). Both are
+noise. The paired per-seed differences for the fixed-beta row are **−5.18 and
++8.39** — the sign flips and both magnitudes meet or exceed the seed sd. The
+two arms' seeds happen to anti-correlate, which is what noise looks like at
+this scale.
+
+Reporting "MoE better by 0.8%" from the means alone would have been an
+artefact. The honest statement is: **no measurable difference between routed
+and dense FFNs at matched active FLOPs after 700 steps.**
+
+The null is clean rather than broken: `load_balance` is 0.78–0.83 against a
+collapse floor of 0.25 for four experts, and zero dead experts in every run.
+The router is genuinely spreading tokens.
+
+## P2 — learnable temperature: **fails, and the direction is the informative part**
+
+Perplexity: 0.36% (dense) and 0.00% (MoE). Nothing.
+
+The direction is the result. `beta_ratio` came out **0.924, 0.936, 0.928,
+0.947** — mean **0.934** — across four independent runs spanning both FFN
+types. The learned temperature settles ~7% *below* `1/sqrt(d)` every time,
+with under 2.5% spread. **Flatter, not sharper.**
+
+The registered prediction was the opposite, and the reasoning behind it was
+wrong. I argued that because initialisation sits fully in the disordered phase
+(`entropy_norm` 1.0000, `participation_frac` 0.9997), the useful direction must
+be toward concentration. That confuses where the model starts with how it gets
+where it is going.
+
+Because beta is a paired measurement on identical initialisations — the
+`learned` arm is bit-identical to `fixed` at step 0 — seed noise cannot explain
+this, which is why it is the only trustworthy effect in T2.
+
+## P3 — do the order parameters track perplexity? **No, and the reason is interesting**
+
+| arm | part_frac | entropy | router_ent | load_bal | dead |
+|---|---|---|---|---|---|
+| dense/fixed | 0.2174 | 0.4097 | — | — | — |
+| dense/learned | 0.2112 | 0.4336 | — | — | — |
+| moe/fixed | 0.2167 | 0.4313 | 0.5207 | 0.7841 | 0 |
+| moe/learned | 0.1985 | 0.3969 | 0.4996 | 0.8079 | 0 |
+
+The rank orders of `participation_frac` and perplexity do not match, so P3 is
+unsupported.
+
+But the table says something the prediction did not anticipate. **All four
+architectures converge to the same operating point**: `participation_frac`
+0.20 ± 0.02, `entropy_norm` 0.41 ± 0.03, from an initialisation at 1.00. Dense
+or routed, fixed or learned temperature, every arm lands in the same place.
+
+And the two knobs move *against* each other. The learned arm has a **flatter**
+temperature (0.934x) yet ends **more** concentrated (part_frac 0.2174 → 0.2112
+dense, 0.2167 → 0.1985 MoE). The q/k weights over-compensated for the relaxed
+temperature.
+
+The reading, offered as a hypothesis and not a result: **the operating phase is
+an attractor, and beta is redundant with the q/k weights as a route to it.**
+The model has several ways to set how concentrated its attention is — the scale
+of q and k, their alignment, and the temperature — and it will reach its target
+phase through whichever are available. That is a direct mechanistic explanation
+for why a free per-head scalar buys no perplexity: it is not adding a degree of
+freedom, it is duplicating one.
+
+## What this costs the larger argument
+
+C2 was the cheap route to re-opening T0. If HELM's 269-vs-86 collapse were a
+temperature bug from inheriting `1/sqrt(d+1)` off a different inner-product
+scale, a learnable beta would fix it for free. **P2 says a learnable beta is
+worth nothing at matched geometry**, so that route is much weaker.
+
+It is not closed. The redundancy argument above says beta does not matter *when
+the weights can compensate*. The Lorentz arm's inner products have a genuinely
+different magnitude scale, and T0's hyperbolic arm was also confined to a 16x
+lower learning rate — so the weights there may not have been free to compensate.
+That is the `head_geometry x beta_mode` cross, which is now worth running for a
+sharper reason than the one originally proposed.
+
+## Methodological finding, which matters more than any arm here
+
+**The order parameters survived the budget cut and the perplexity comparisons
+did not.** `participation_frac` reproduced to three significant figures across
+seeds (0.2173 vs 0.2176 on dense/fixed) while perplexity on those same two runs
+moved 3.6%. Instrumentation of internal state was an order of magnitude more
+sensitive than the loss at the same compute.
+
+The corollary for anything run next: **more seeds beat more steps.** Four to six
+seeds at 700 steps would resolve P1 and P2; two seeds at 2000 steps would not.
