@@ -43,7 +43,21 @@ forward before it can match — an extra composition step. Reordering to
 `QUERY HOP x -> answer` puts the entity *at* the prediction site, which is the
 layout an induction head can use directly.
 
-### 0.4 What the pilots settled about scale
+### 0.4 The paired arms were not paired
+
+Found by `tests_recur.py`, not by looking at a result: drawing every parameter
+from one RNG stream means that adding a parameter -- a register bank in E2, a
+halting gate in E4 -- shifts every draw after it, so two arms with the same seed
+shared *no* weights. Every "paired difference" in E2 and E4 would have been an
+unpaired difference wearing a paired label, and nothing in the numbers would
+have looked wrong.
+
+Fix: initialise each parameter from a generator keyed by its **name**, so an
+arm that adds a tensor leaves the others bit-identical. E0 was rerun from
+scratch after this change rather than mixing the two initialisation schemes in
+one table.
+
+### 0.5 What the pilots settled about scale
 
 | probe | result |
 | --- | --- |
@@ -57,7 +71,7 @@ So the study runs at **6 entities, 6 questions per context, one hop count per
 run**. Hop count became an experimental factor instead of a within-batch
 nuisance, which is a better design than the one it replaced.
 
-### 0.5 Attention Residuals is a drag at this scale — but not a wall
+### 0.6 Attention Residuals is a drag at this scale — but not a wall
 
 The pilot ladder, one component removed at a time, hop 1, 12 entities:
 

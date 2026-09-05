@@ -15,12 +15,12 @@ one-at-a-time ablations, because the two mechanisms could easily interact
 computes) and a factorial costs one extra cell to find that out.
 
 This is not a formality. The pilot ladder in `RESULTS.md` found that Full
-AttnRes, implemented from the report's equations, is a *drag* at this scale
-large enough to decide the design of every later experiment: the arm without it
-solves the composition task in about a thousand steps, and the arm with it is
-still at chance. E0 is where that is measured properly, with seeds, on both
-task families, so that the decision to run E1-E4 on standard residuals rests on
-a measurement rather than on a pilot.
+AttnRes, implemented from the report's equations, is a substantial *drag* at
+this scale -- roughly 1.6x the steps to the same accuracy, and not rescued by
+removing sandwich normalisation -- while still getting there in the end. E0
+measures that properly, with seeds, on both task families. Because the drag is
+a cost in steps rather than a wall, E1-E4 keep the faithful K3 arm; had it been
+a wall, this is where the decision to drop it would have been justified.
 
 That result is about *this* scale and should not be read as a claim about
 AttnRes: the report's own setting is 32+ layers and a compute budget six orders
@@ -110,9 +110,10 @@ def report() -> str:
         if alt:
             values = [r["final"][metric] for r in alt.values()]
             m, sd = mean_sd(values)
-            lines += [f"**Noise floor ({task}, standard residuals -- the arm E1-E4 "
-                      f"are run on): sd {sd:.4f} over {len(values)} seeds, "
-                      f"mean {m:.4f}.**", ""]
+            lines += [f"**Same, with standard residuals instead: sd {sd:.4f} over "
+                      f"{len(values)} seeds, mean {m:.4f}.** E1-E4 run the K3 "
+                      f"arm; this row says how much of the spread is AttnRes.",
+                      ""]
     return "\n".join(lines)
 
 

@@ -22,6 +22,7 @@ blocks; ``2 * n_layers`` counts AttnRes sources.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass, field, asdict, replace
 from typing import Dict, List, Optional, Tuple
@@ -423,26 +424,47 @@ class Recurrent(nn.Module):
         self.register_buffer("rotary",
                              rotary_table(head_dim, cfg.max_seq_len + cfg.registers),
                              persistent=False)
-        self.apply(self._init)
+        self._init_parameters()
 
-    @staticmethod
-    def _init(m):
-        """Fan-in scaled, not the GPT-2 constant.
+    def _init_parameters(self) -> None:
+        """Initialise every parameter from a generator keyed by its *name*.
 
-        An earlier version used ``std=0.02`` everywhere, which is the
-        convention for ``d_model`` around 768. At ``dim=64`` it is six times
-        smaller than fan-in scaling, and the effect was not subtle: attention
-        logits started near zero, attention started near uniform, and the model
-        sat at chance on a task a textbook transformer with default
-        initialisation solved completely (`probe_reference.py`, and the ladder
-        in `RESULTS.md`). Initialisation was the whole gap.
+        Two things this buys, both load-bearing:
+
+        **Fan-in scaling, not the GPT-2 constant.** An earlier version used
+        ``std=0.02`` everywhere, which is the convention for ``d_model`` around
+        768. At ``dim=64`` it is six times smaller than fan-in scaling, and the
+        effect was not subtle: attention logits started near zero, attention
+        started near uniform, and the model sat at chance on a task a textbook
+        transformer with default initialisation solved completely
+        (`probe_reference.py`, and the ladder in `RESULTS.md`).
+
+        **Per-name generators, not one stream.** Drawing every tensor from one
+        RNG stream means adding a parameter -- a register bank, a halting gate
+        -- shifts the draws of every parameter after it, so two arms with the
+        same seed no longer share any weights and the paired differences E2
+        reports would not be paired. Keying the generator on the parameter's
+        name makes the shared weights bit-identical across arms;
+        ``tests_recur.py`` checks exactly this.
         """
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=m.in_features ** -0.5)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Embedding):
-            nn.init.normal_(m.weight, std=1.0)
+        for name, p in self.named_parameters():
+            key = (self.cfg.seed * 1_000_003 +
+                   int.from_bytes(hashlib.blake2b(name.encode(), digest_size=4)
+                                  .digest(), "little")) % (2 ** 31)
+            g = torch.Generator().manual_seed(key)
+            with torch.no_grad():
+                if name.endswith("queries") or "exit_gate" in name or \
+                        name.endswith("bias"):
+                    p.zero_()                      # AttnRes and the gate start neutral
+                elif p.ndim == 1:
+                    p.fill_(1.0)                   # RMSNorm scales
+                elif name == "embed.weight":
+                    p.copy_(torch.randn(p.shape, generator=g))
+                elif name == "register_init":
+                    p.copy_(torch.randn(p.shape, generator=g) * 0.02)
+                else:
+                    fan_in = p.shape[-2] if p.ndim == 3 else p.shape[-1]
+                    p.copy_(torch.randn(p.shape, generator=g) * fan_in ** -0.5)
 
     # --- AttnRes plumbing --------------------------------------------------
     def pseudo_query(self, index: int, kind: str, step: int):
