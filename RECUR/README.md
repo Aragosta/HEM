@@ -22,6 +22,8 @@ e3_step_routing.py    loop-index-conditioned MoE routing
 e4_halting.py         step-indexed vs step-invariant gates, and extrapolation
 probe_learnable.py    minimal learnability probe (diagnosed two dead pilots)
 probe_reference.py    a textbook transformer, as the "is it my model?" control
+tests_recur.py        checks on the properties a wrong result would not reveal
+report.py             rebuilds the RESULTS.md tables from results/*.json
 BASELINE.md           what is K3's, what was substituted, what is ours
 DESIGN.md             the MECE argument, the reading rules, the predictions
 RESULTS.md            what the runs found, including the pilots that failed

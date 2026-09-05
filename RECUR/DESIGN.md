@@ -14,7 +14,7 @@ per axis:
 | what the loop may read and write | `registers`, `loop_memory` | **E2** |
 | what the loop computes at each step | `step_routing` | **E3** |
 | when the loop stops | `halting` | **E4** |
-| depth versus emitted tokens as substitutable compute | latent `loops` vs scratchpad tokens | **E5** |
+| depth versus emitted tokens as substitutable compute | latent `loops` vs scratchpad tokens | **E5** (specified, not run — `PARKED.md`) |
 
 Two items on the brief's list are deliberately not experiments here.
 **Parallel loops / CLP** (§7.1) is deployment engineering: it changes wall-clock
@@ -43,10 +43,12 @@ So:
 - **`bytes`** — WikiText-2 and PTB, byte level, official splits, bits per byte.
   The storage-and-statistics axis. Prediction: recurrence buys little.
 - **`hops`** — in-context composition over a random permutation written into
-  the context, scored as accuracy on one answer token at each hop count
-  1..4. The manipulation axis, with a knob (`h`) that says how much sequential
-  composition an example needs. Fresh graph per example, so nothing can be
-  memorised: this measures manipulation with storage held at zero.
+  the context, six questions per context, scored as accuracy on the answer
+  tokens. The manipulation axis, with a knob (`h`, fixed per run) that says how
+  much sequential composition an example needs. Fresh graph per example, so
+  nothing can be memorised: this measures manipulation with storage held at
+  zero, and queries whose answer is the query entity are rejected so that
+  "copy the query" cannot masquerade as composition.
 - **`twochain`** — the same, but the answer is a function of *two* chains, so a
   partial result must survive while the second chain is computed. This is the
   task E2 needs and it differs from `hops` in one field.
@@ -101,7 +103,9 @@ no-training-cost reference.
 
 **E5 — latent depth versus emitted tokens.** Compute-matched: an R-loop model
 answering in one token against an R=1 model emitting `h` scratchpad tokens
-first. Same task, same parameters, matched forward FLOPs.
+first. Same task, same parameters, matched forward FLOPs. Specified in full in
+`PARKED.md` and **not run**: it needs a second task layout and an
+autoregressive evaluation path, and the CPU budget was committed to E0-E4.
 
 ## 4. Reading rules, fixed before the runs
 
