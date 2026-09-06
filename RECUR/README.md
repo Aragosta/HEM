@@ -20,16 +20,20 @@ e1_depth_data.py      depth x data: does the depth ceiling move with budget?
 e2_writable_state.py  does the loop need somewhere to write?
 e3_step_routing.py    loop-index-conditioned MoE routing
 e4_halting.py         step-indexed vs step-invariant gates, and extrapolation
+t1..t5, t2b           the expert graph: sparsity, pruning, rewiring, trajectories
+a1..a3                the attention temperature, and what it subsumes
 probe_learnable.py    minimal learnability probe (diagnosed two dead pilots)
 probe_reference.py    a textbook transformer, as the "is it my model?" control
 tests_recur.py        checks on the properties a wrong result would not reveal
 report.py             rebuilds the RESULTS.md tables from results/*.json
 BASELINE.md           what is K3's, what was substituted, what is ours
 DESIGN.md             the MECE argument, the reading rules, the predictions
-RESULTS.md            what the runs found, including the pilots that failed
+RESULTS.md            round one: depth, state, routing, halting (E0-E4)
+EXPERTS.md            round two: the expert graph (T1-T5)
+ATTENTION.md          round three: the attention temperature (A1-A3)
 PARKED.md             E5 and the rest of the brief's list: specified, not run
 results/*.json        one file per run (gitignored, as elsewhere in this repo)
-recur_results.json    all 90 runs consolidated, committed, minus training curves
+recur_results.json    all 176 runs consolidated, committed, minus training curves
 ```
 
 ## The question
@@ -87,18 +91,28 @@ their file exists, so an interrupted experiment resumes.
 
 ## Status
 
-**Complete: 90 runs across E0-E4.** `RESULTS.md` opens with the verdict against
+**Complete: 176 runs across three rounds.** `RESULTS.md` opens with the verdict against
 the ten predictions registered before the runs, and closes with what the results
 say to run next.
 
-The short version: depth helps composition and nothing else, its ceiling does
-**not** move with the token budget (the brief's central hypothesis, and its own
-stated kill condition), and the mechanism looks like iteration to a fixed point
-with a distinguished first step -- routing changes sharply from loop 1 to loop 2
-and then stops. The one clear win is loop-index-conditioned MoE routing
-(+0.037 outside a 0.006 seed spread), and the cheap version of it beats the
-expressive one. Ouro's step-indexed halting gate fails to extrapolate exactly as
-predicted; Huginn's zero-shot KL exit gets full-depth accuracy at 56% of the
+The short version, in the order the rounds found it:
+
+1. **Depth** is worth about two loops and substitutes for data rather than
+   compounding with it. The ceiling does **not** move with the token budget --
+   the brief's central hypothesis, and its own stated kill condition.
+2. **The loop is a contraction.** Expert-set overlap rises exactly as the state
+   update falls, r = -0.877 over 24 transitions, so routing convergence is the
+   shadow of state convergence. Saturation is a fixed point being reached, not a
+   scratchpad running out (which E2 looked for and did not find).
+3. **The contraction is governed by attention temperature**, and that one scalar
+   moves accuracy by 0.26 -- four times any architectural change tested here.
+   The optimum is *colder* than the default and gets colder as depth grows.
+   Tuning it **subsumes** the only architectural win the earlier rounds produced
+   (loop-conditioned MoE routing: +0.062 at the default temperature, -0.018 once
+   the temperature is right).
+
+Also: Ouro's step-indexed halting gate fails to extrapolate exactly as
+predicted, and Huginn's zero-shot KL exit gets full-depth accuracy at 56% of the
 depth for free.
 
 The pilots are part of the record too: the composition task did not learn in two

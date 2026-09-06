@@ -63,37 +63,6 @@ Cells with comparable forward FLOPs per token, so the question is where a fixed 
 | 3 | R=1, k=8 | 4.13e+05 | 0.586 ± 0.111 |
 | 3 | R=2, k=4 | 4.98e+05 | 0.682 ± 0.081 |
 
-
-## 2-hop composition (accuracy)
-
-| loops | k=1 | k=2 | k=4 | k=8 | best k |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 0.585 ± 0.004 | 0.548 ± 0.015 | 0.574 ± 0.076 | 0.544 ± 0.036 | **1** |
-| 2 | 0.559 ± 0.014 | 0.590 ± 0.049 | 0.571 ± 0.035 | 0.599 ± 0.038 | **8** |
-
-## 3-hop composition (accuracy)
-
-| loops | k=1 | k=2 | k=4 | k=8 | best k |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 0.581 ± 0.050 | 0.692 ± 0.037 | 0.593 ± 0.078 | 0.586 ± 0.111 | **2** |
-| 2 | 0.655 ± 0.002 | 0.625 ± 0.006 | 0.682 ± 0.081 | 0.674 ± 0.099 | **4** |
-
-## iso-compute: is depth a substitute for active experts?
-
-Cells with comparable forward FLOPs per token, so the question is where a fixed budget should go.
-
-| hops | arm | FLOPs/token | accuracy |
-| --- | --- | --- | --- |
-| 2 | R=1, k=4 | 3.27e+05 | 0.574 ± 0.076 |
-| 2 | R=2, k=2 | 4.33e+05 | 0.590 ± 0.049 |
-| 2 | R=1, k=8 | 4.13e+05 | 0.544 ± 0.036 |
-| 2 | R=2, k=4 | 4.98e+05 | 0.571 ± 0.035 |
-| 3 | R=1, k=4 | 3.27e+05 | 0.593 ± 0.078 |
-| 3 | R=2, k=2 | 4.34e+05 | 0.625 ± 0.006 |
-| 3 | R=1, k=8 | 4.13e+05 | 0.586 ± 0.111 |
-| 3 | R=2, k=4 | 4.98e+05 | 0.682 ± 0.081 |
-
-
 ## 2. T3 — overproduce, then prune
 
 <!-- filled by: python t3_prune_schedule.py --report-only -->
@@ -110,7 +79,6 @@ Paired per-seed differences against `k2` (same seed, same data stream, same weig
 - `k8`: -0.025, +0.122 (mean +0.049)
 - `anneal`: -0.044, +0.122 (mean +0.039)
 - `phase`: -0.003, +0.025 (mean +0.011)
-
 
 ## 3. T4 — local rewiring instead of top-k
 
@@ -137,23 +105,6 @@ From the co-activation record of the final model: the mean number of experts eac
 | 3 | topk | 1 | 3.78 | 3.73 |
 | 3 | local | 0 | 5.93 | 6.04 |
 | 3 | local | 1 | 5.92 | 3.83 |
-
-
-## experts per token by loop position (T4b)
-
-From the co-activation record of the final model: the mean number of experts each token activates at loop 1 and loop 2. A declining profile is the wide-entry / narrow-refinement pattern that E3 found by conditioning the router, arrived at here by a local rule that knows nothing about loops.
-
-| hops | arm | seed | loop 1 | loop 2 |
-| --- | --- | --- | --- | --- |
-| 2 | topk | 0 | 3.85 | 3.54 |
-| 2 | topk | 1 | 3.66 | 3.83 |
-| 2 | local | 0 | 6.53 | 5.16 |
-| 2 | local | 1 | 5.44 | 4.52 |
-| 3 | topk | 0 | 3.79 | 3.71 |
-| 3 | topk | 1 | 3.78 | 3.73 |
-| 3 | local | 0 | 5.93 | 6.04 |
-| 3 | local | 1 | 5.92 | 3.83 |
-
 
 ## 4. T2 — expert trajectories
 
@@ -191,39 +142,69 @@ From the co-activation record of the final model: the mean number of experts eac
 | 2 | 2 | 1.863 | 5.68 | 12 |
 | 3 | 2 | 1.842 | 6.14 | 20 |
 
+<!-- filled by: python t2b_depth4.py --report-only -->
 
-## does routing convergence track state convergence? (T2a)
+## accuracy
 
-| run | loop | expert-set overlap | relative state move |
+| arm | accuracy | sd | n |
 | --- | --- | --- | --- |
-| t1_h2_R2_k1_s0 | 1->2 | 0.306 | 0.627 |
-| t1_h2_R2_k1_s1 | 1->2 | 0.213 | 0.751 |
-| t1_h2_R2_k2_s0 | 1->2 | 0.285 | 0.733 |
-| t1_h2_R2_k2_s1 | 1->2 | 0.314 | 0.668 |
-| t1_h2_R2_k4_s0 | 1->2 | 0.512 | 0.666 |
-| t1_h2_R2_k4_s1 | 1->2 | 0.526 | 0.778 |
-| t1_h2_R2_k8_s0 | 1->2 | 0.747 | 0.533 |
-| t1_h2_R2_k8_s1 | 1->2 | 0.659 | 0.884 |
-| t1_h3_R2_k1_s0 | 1->2 | 0.286 | 0.714 |
-| t1_h3_R2_k1_s1 | 1->2 | 0.282 | 0.693 |
-| t1_h3_R2_k2_s0 | 1->2 | 0.416 | 0.809 |
-| t1_h3_R2_k2_s1 | 1->2 | 0.342 | 0.684 |
+| base | 0.608 | 0.036 | 2 |
+| phase | 0.668 | 0.081 | 2 |
+| local | 0.603 | 0.041 | 2 |
+| bias | 0.671 | 0.032 | 2 |
 
-## do wrong answers settle later? (T2b)
+## the convergence curve (T2a)
 
-| family | mean settle step (correct) | (wrong) | difference | n runs |
+Expert-set overlap between consecutive loops, and the relative size of the state update at the same transition. Under the fixed-point reading the first rises and the second falls, together.
+
+| arm | seed | transition | expert overlap | state move |
 | --- | --- | --- | --- | --- |
-| t1 | 1.827 | 1.864 | +0.036 | 16 |
-| t3 | 1.845 | 1.884 | +0.039 | 8 |
-| t4 | 1.847 | 1.876 | +0.029 | 8 |
+| base | 0 | 1->2 | 0.493 | 0.508 |
+| base | 0 | 2->3 | 0.711 | 0.191 |
+| base | 0 | 3->4 | 0.847 | 0.080 |
+| base | 1 | 1->2 | 0.404 | 0.575 |
+| base | 1 | 2->3 | 0.747 | 0.191 |
+| base | 1 | 3->4 | 0.853 | 0.086 |
+| phase | 0 | 1->2 | 0.533 | 0.404 |
+| phase | 0 | 2->3 | 0.525 | 0.121 |
+| phase | 0 | 3->4 | 0.911 | 0.048 |
+| phase | 1 | 1->2 | 0.551 | 0.559 |
+| phase | 1 | 2->3 | 0.519 | 0.213 |
+| phase | 1 | 3->4 | 0.896 | 0.097 |
+| local | 0 | 1->2 | 0.630 | 0.440 |
+| local | 0 | 2->3 | 0.898 | 0.137 |
+| local | 0 | 3->4 | 0.962 | 0.051 |
+| local | 1 | 1->2 | 0.241 | 1.463 |
+| local | 1 | 2->3 | 0.209 | 1.229 |
+| local | 1 | 3->4 | 0.194 | 1.646 |
+| bias | 0 | 1->2 | 0.603 | 0.390 |
+| bias | 0 | 2->3 | 0.744 | 0.134 |
+| bias | 0 | 3->4 | 0.812 | 0.061 |
+| bias | 1 | 1->2 | 0.373 | 0.733 |
+| bias | 1 | 2->3 | 0.560 | 0.337 |
+| bias | 1 | 3->4 | 0.702 | 0.205 |
 
-## settle step by task complexity
+## settle step, right versus wrong (T2b)
 
-| hops | loops | mean settle step | mean experts/token | n |
-| --- | --- | --- | --- | --- |
-| 2 | 2 | 1.863 | 5.68 | 12 |
-| 3 | 2 | 1.842 | 6.14 | 20 |
+| arm | correct | wrong | difference |
+| --- | --- | --- | --- |
+| base | 2.607 | 2.563 | -0.044 |
+| phase | 3.215 | 3.225 | +0.010 |
+| local | 3.457 | 3.429 | -0.028 |
+| bias | 2.944 | 2.936 | -0.008 |
 
+## experts per token by loop position (T4b, four loops)
+
+| arm | seed | loop 1 | loop 2 | loop 3 | loop 4 |
+| --- | --- | --- | --- | --- | --- |
+| base | 0 | 3.81 | 3.78 | 3.71 | 3.75 |
+| base | 1 | 3.76 | 3.78 | 3.79 | 3.80 |
+| phase | 0 | 11.67 | 6.72 | 3.65 | 3.66 |
+| phase | 1 | 11.99 | 7.01 | 3.78 | 3.78 |
+| local | 0 | 6.16 | 5.56 | 5.62 | 5.59 |
+| local | 1 | 4.62 | 3.82 | 5.10 | 3.79 |
+| bias | 0 | 3.74 | 3.73 | 3.73 | 3.74 |
+| bias | 1 | 3.75 | 3.81 | 3.77 | 3.76 |
 
 ## 5. T5 — the expert co-activation graph
 
@@ -262,42 +243,6 @@ From the co-activation record of the final model: the mean number of experts eac
 - corr(accuracy, effective experts) = +0.105
 
 Effective experts: mean 15.29 of a pool of 16 (T5b).
-
-
-## structure per loop (first 14 runs)
-
-| run | loop | spectral gap | modularity | effective experts | experts/token |
-| --- | --- | --- | --- | --- | --- |
-| t1_h2_R1_k1_s0 | loop1 | 0.514 | 0.155 | 15.91 | 1.94 |
-| t1_h2_R1_k1_s1 | loop1 | 0.468 | 0.184 | 15.93 | 1.95 |
-| t1_h2_R1_k2_s0 | loop1 | 0.585 | 0.168 | 15.93 | 3.71 |
-| t1_h2_R1_k2_s1 | loop1 | 0.787 | 0.068 | 15.90 | 3.74 |
-| t1_h2_R1_k4_s0 | loop1 | 0.745 | 0.090 | 15.75 | 7.07 |
-| t1_h2_R1_k4_s1 | loop1 | 0.780 | 0.067 | 15.95 | 7.03 |
-| t1_h2_R1_k8_s0 | loop1 | 0.993 | -0.013 | 15.91 | 12.36 |
-| t1_h2_R1_k8_s1 | loop1 | 0.977 | -0.004 | 15.90 | 11.71 |
-| t1_h2_R2_k1_s0 | loop1 | 0.474 | 0.192 | 15.39 | 1.95 |
-| t1_h2_R2_k1_s0 | loop2 | 0.420 | 0.200 | 15.52 | 1.92 |
-| t1_h2_R2_k1_s1 | loop1 | 0.659 | 0.109 | 14.36 | 1.93 |
-| t1_h2_R2_k1_s1 | loop2 | 0.564 | 0.159 | 14.26 | 1.89 |
-| t1_h2_R2_k2_s0 | loop1 | 0.757 | 0.047 | 14.20 | 3.85 |
-| t1_h2_R2_k2_s0 | loop2 | 0.736 | 0.090 | 14.22 | 3.54 |
-| t1_h2_R2_k2_s1 | loop1 | 0.555 | 0.182 | 15.02 | 3.66 |
-| t1_h2_R2_k2_s1 | loop2 | 0.749 | 0.102 | 15.35 | 3.83 |
-| t1_h2_R2_k4_s0 | loop1 | 0.919 | 0.006 | 15.74 | 6.81 |
-| t1_h2_R2_k4_s0 | loop2 | 0.765 | 0.088 | 15.76 | 6.78 |
-| t1_h2_R2_k4_s1 | loop1 | 0.833 | 0.042 | 15.69 | 6.97 |
-| t1_h2_R2_k4_s1 | loop2 | 0.837 | 0.056 | 15.69 | 7.23 |
-
-## does structure predict accuracy? (T5a)
-
-- runs compared: 48
-- corr(accuracy, spectral gap) = +0.166
-- corr(accuracy, modularity) = -0.175
-- corr(accuracy, effective experts) = +0.105
-
-Effective experts: mean 15.29 of a pool of 16 (T5b).
-
 
 ## 6. What went wrong, and what it would take to fix
 

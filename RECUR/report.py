@@ -24,6 +24,15 @@ sys.path.insert(0, str(HERE))
 import e0_baseline, e1_depth_data, e2_writable_state, e3_step_routing, e4_halting  # noqa: E402
 import t1_sparsity_depth, t2_trajectories, t2b_depth4, t3_prune_schedule  # noqa: E402
 import t4_rewiring, t5_expert_graph                                       # noqa: E402
+import a1_temperature, a2_beta_vs_router, a3_cold_plus_router             # noqa: E402
+
+# Prose headings, as opposed to headings inside a generated table block. The
+# regeneration used to run to "the next ## heading", but generated bodies carry
+# their own ## subheadings, so the second run replaced only the first table and
+# left the rest behind as duplicates. Sections now end at an explicit prose
+# heading.
+PROSE = re.compile(r"^## (?:Verdict|Part \d|The verdict|The caveat|What |\d+\. )",
+                   re.M)
 
 # (document, script name in the marker, report function)
 SECTIONS = [
@@ -38,6 +47,9 @@ SECTIONS = [
     ("EXPERTS.md", "t2_trajectories.py", t2_trajectories.report),
     ("EXPERTS.md", "t2b_depth4.py", t2b_depth4.report),
     ("EXPERTS.md", "t5_expert_graph.py", t5_expert_graph.report),
+    ("ATTENTION.md", "a1_temperature.py", a1_temperature.report),
+    ("ATTENTION.md", "a2_beta_vs_router.py", a2_beta_vs_router.report),
+    ("ATTENTION.md", "a3_cold_plus_router.py", a3_cold_plus_router.report),
 ]
 
 
@@ -58,10 +70,19 @@ def main() -> None:
             continue                       # nothing has finished for this one yet
         # drop the report's own H1, the section already has a heading
         body = "\n".join(body.splitlines()[1:]).strip()
-        pattern = re.compile(re.escape(marker) + r"(.*?)(?=\n## |\Z)", re.S)
-        replacement = marker + "\n\n" + body + "\n\n"
-        if pattern.search(text):
-            text = pattern.sub(lambda _: replacement, text, count=1)
+        start = text.find(marker)
+        if start >= 0:
+            after = start + len(marker)
+            # A section ends at the next prose heading *or* the next marker,
+            # whichever comes first: EXPERTS.md section 4 carries two markers
+            # with prose between them, and ending only at prose headings ate
+            # the second one.
+            nxt = PROSE.search(text, after)
+            end = nxt.start() if nxt else len(text)
+            nxt_marker = text.find("<!-- filled by:", after)
+            if 0 <= nxt_marker < end:
+                end = nxt_marker
+            text = text[:after] + "\n\n" + body + "\n\n" + text[end:]
         else:
             print(f"marker for {script} not found in {doc}; skipped",
                   file=sys.stderr)
