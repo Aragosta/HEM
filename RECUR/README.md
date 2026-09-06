@@ -28,7 +28,8 @@ BASELINE.md           what is K3's, what was substituted, what is ours
 DESIGN.md             the MECE argument, the reading rules, the predictions
 RESULTS.md            what the runs found, including the pilots that failed
 PARKED.md             E5 and the rest of the brief's list: specified, not run
-results/*.json        one file per run, config and metrics included
+results/*.json        one file per run (gitignored, as elsewhere in this repo)
+recur_results.json    all 90 runs consolidated, committed, minus training curves
 ```
 
 ## The question
@@ -86,9 +87,24 @@ their file exists, so an interrupted experiment resumes.
 
 ## Status
 
-See `RESULTS.md`. The pilots are part of the record: the composition task did
-not learn in two earlier forms, and the initialisation of `model.py` was wrong
-in a way that cost several hours and is now a comment in the code.
+**Complete: 90 runs across E0-E4.** `RESULTS.md` opens with the verdict against
+the ten predictions registered before the runs, and closes with what the results
+say to run next.
+
+The short version: depth helps composition and nothing else, its ceiling does
+**not** move with the token budget (the brief's central hypothesis, and its own
+stated kill condition), and the mechanism looks like iteration to a fixed point
+with a distinguished first step -- routing changes sharply from loop 1 to loop 2
+and then stops. The one clear win is loop-index-conditioned MoE routing
+(+0.037 outside a 0.006 seed spread), and the cheap version of it beats the
+expressive one. Ouro's step-indexed halting gate fails to extrapolate exactly as
+predicted; Huginn's zero-shot KL exit gets full-depth accuracy at 56% of the
+depth for free.
+
+The pilots are part of the record too: the composition task did not learn in two
+earlier forms, the initialisation of `model.py` was the GPT-2 constant at
+`dim=64` and was the entire gap against a reference transformer, and the paired
+arms were not actually paired until `tests_recur.py` caught it.
 
 ## Sources
 

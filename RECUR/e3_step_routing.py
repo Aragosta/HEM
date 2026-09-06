@@ -118,6 +118,26 @@ def report() -> str:
             load = f"{sum(loads) / len(loads):.4f}" if loads else "-"
             lines.append(f"| {arm} | {m:.4f} | {sd:.4f} | {len(values)} | {load} |")
         lines.append("")
+
+    lines += ["## does routing actually differ across loops?", "",
+              "Jensen-Shannon divergence between the expert-usage distributions of "
+              "consecutive loops, from a collected forward pass at the end of "
+              "training. The mechanism claim lives or dies here: a conditioner "
+              "that leaves routing unchanged has not done what it was added to "
+              "do, whatever accuracy says.", "",
+              "| arm | task | seed | JS 1->2 | JS 2->3 | JS 3->4 | JS 1->4 |",
+              "| --- | --- | --- | --- | --- | --- | --- |"]
+    for arm in ARMS:
+        for task in ("hops", "bytes"):
+            for name, r in sorted(load_results(f"e3_{task}_{arm}_s").items()):
+                h = r.get("routing_hist") or []
+                if len(h) < 2:
+                    continue
+                steps = " | ".join(f"{js_divergence(h[i], h[i + 1]):.4f}"
+                                   for i in range(len(h) - 1))
+                lines.append(f"| {arm} | {task} | {name[-1]} | {steps} | "
+                             f"{js_divergence(h[0], h[-1]):.4f} |")
+    lines.append("")
     return "\n".join(lines)
 
 
