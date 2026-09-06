@@ -180,9 +180,10 @@ class LatentMoE(nn.Module):
     cannot make the ordering depend on the token differently per loop).
     """
 
-    def __init__(self, cfg: Config, max_steps: int):
+    def __init__(self, cfg: Config, max_steps: int, is_core: bool = False):
         super().__init__()
         self.cfg = cfg
+        self.is_core = is_core
         dl, de = cfg.d_latent, cfg.d_expert
         self.down = nn.Linear(cfg.dim, dl, bias=False)
         self.up = nn.Linear(dl, cfg.dim, bias=False)
@@ -277,7 +278,7 @@ class LatentMoE(nn.Module):
         """
         if self.active_override is not None:
             return max(1, min(self.n_routed, int(self.active_override)))
-        if self.cfg.k_by_loop:
+        if self.cfg.k_by_loop and self.is_core:
             table = self.cfg.k_by_loop
             return max(1, min(self.n_routed, table[min(step, len(table) - 1)]))
         return self.n_active
@@ -325,13 +326,14 @@ class DenseFFN(nn.Module):
 class Block(nn.Module):
     """One transformer block = two AttnRes sources (attention, then MLP)."""
 
-    def __init__(self, cfg: Config, max_steps: int):
+    def __init__(self, cfg: Config, max_steps: int, is_core: bool = False):
         super().__init__()
         self.cfg = cfg
         self.attn_norm = nn.RMSNorm(cfg.dim, eps=1e-5)
         self.attn = Attention(cfg)
         self.mlp_norm = nn.RMSNorm(cfg.dim, eps=1e-5)
-        self.mlp = LatentMoE(cfg, max_steps) if cfg.moe else DenseFFN(cfg, max_steps)
+        self.mlp = (LatentMoE(cfg, max_steps, is_core=is_core) if cfg.moe
+                    else DenseFFN(cfg, max_steps))
         # Ouro reports sandwich normalisation as load-bearing for recurrent
         # stability: RMSNorm on the way out as well as in.
         self.post_attn = nn.RMSNorm(cfg.dim, eps=1e-5) if cfg.sandwich_norm else None
@@ -443,8 +445,11 @@ class Recurrent(nn.Module):
         torch.manual_seed(cfg.seed)
         self.embed = nn.Embedding(cfg.vocab_size, cfg.dim)
         max_steps = max(cfg.loops, cfg.max_train_loops, 1)
-        mk = lambda n: nn.ModuleList([Block(cfg, max_steps) for _ in range(n)])
-        self.prelude, self.core, self.coda = mk(cfg.n_prelude), mk(cfg.n_core), mk(cfg.n_coda)
+        mk = lambda n, core=False: nn.ModuleList(
+            [Block(cfg, max_steps, is_core=core) for _ in range(n)])
+        self.prelude = mk(cfg.n_prelude)
+        self.core = mk(cfg.n_core, core=True)
+        self.coda = mk(cfg.n_coda)
         self.final_norm = nn.RMSNorm(cfg.dim, eps=1e-5)
         self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.src_norm = nn.RMSNorm(cfg.dim, eps=1e-5)
