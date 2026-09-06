@@ -220,6 +220,31 @@ def evaluate_kl_exit(model, eval_set, spec, loops: int,
 
 
 @torch.no_grad()
+def set_active_experts(model, k: int) -> None:
+    """Override every MoE layer's k for the next forward pass."""
+    from model import LatentMoE
+    for m in model.modules():
+        if isinstance(m, LatentMoE):
+            m.active_override = int(k)
+
+
+def routing_state(model) -> Dict:
+    """What the router settled on: mean experts per token, and the thresholds.
+
+    Under threshold routing the mean is an *emergent* quantity, so it is the
+    headline number for T4; under top-k it is a constant and is recorded only
+    so the two arms can be compared at equal average sparsity.
+    """
+    from model import LatentMoE
+    out = {"mean_k": [], "tau": [], "load": []}
+    for m in model.modules():
+        if isinstance(m, LatentMoE):
+            out["mean_k"].append(float(m.mean_k))
+            out["tau"].append(m.tau.tolist())
+            out["load"].append(m.load.tolist())
+    return out
+
+
 def routing_histograms(model, tokens) -> List[List[float]]:
     """Expert usage per loop, so "does routing actually differ per step" is
     measurable rather than assumed.
@@ -234,12 +259,12 @@ def routing_histograms(model, tokens) -> List[List[float]]:
     model.eval()
     _, aux = model(tokens, collect=True)
     model.train()
-    idxs = aux.get("routing", [])
+    masks = aux.get("routing", [])
     per_loop = []
-    for start in range(0, len(idxs), cfg.n_core):
+    for start in range(0, len(masks), cfg.n_core):
         counts = torch.zeros(cfg.n_routed)
-        for t in idxs[start:start + cfg.n_core]:
-            counts += torch.bincount(t.reshape(-1), minlength=cfg.n_routed).float()
+        for m in masks[start:start + cfg.n_core]:
+            counts += m.float().sum(0)
         per_loop.append((counts / counts.sum().clamp_min(1)).tolist())
     return per_loop
 
@@ -248,7 +273,8 @@ def train_hops(cfg: Config, spec: HopSpec, steps: int, batch_size: int = 64,
                lr: float = 3e-3, data_seed: int = 1234, eval_seed: int = 99,
                eval_size: int = 256, eval_every: int = 0,
                eval_loops: Sequence[int] = (),
-               train_loops: Optional[Callable[[int], int]] = None) -> Dict:
+               train_loops: Optional[Callable[[int], int]] = None,
+               k_schedule: Optional[Callable[[float], int]] = None) -> Dict:
     """Train on fresh in-context graphs; score on a fixed evaluation set.
 
     ``train_loops`` lets an arm sample its recurrence count per batch (Huginn's
@@ -265,6 +291,10 @@ def train_hops(cfg: Config, spec: HopSpec, steps: int, batch_size: int = 64,
     for step in range(steps):
         for group in opt.param_groups:
             group["lr"] = _lr_at(step, steps, lr)
+        if k_schedule is not None:
+            # T3: the number of active experts is a *schedule*, the way
+            # synaptic density is in development -- overproduce, then prune.
+            set_active_experts(model, k_schedule(step / max(1, steps - 1)))
         tokens, target, _ = hop_batch(spec, batch_size, g)
         loops = train_loops(step) if train_loops else None
         logits, aux = model(tokens, loops=loops)
@@ -309,6 +339,9 @@ def train_hops(cfg: Config, spec: HopSpec, steps: int, batch_size: int = 64,
         "seconds": time.time() - t0, "history": history, "final": final,
         "by_depth": by_depth, "exits": exits,
         "routing_hist": routing_histograms(model, eval_set[spec.hops[0]][0][:64]),
+        "trajectories": expert_trajectories(model, eval_set, spec),
+        "expert_graph": expert_graph(model, eval_set, spec),
+        "routing_state": routing_state(model),
         "expert_load": [l.tolist() for l in model.expert_load()],
         "commit": git_commit(),
     }, model
@@ -379,3 +412,135 @@ def save(name: str, payload: Dict) -> Path:
     path = RESULTS / f"{name}.json"
     path.write_text(json.dumps(payload, indent=2))
     return path
+
+
+# ------------------------------------------------- T2/T5: the expert graph
+
+def _loop_masks(aux, n_core: int):
+    """Group per-(loop, block) routing masks into one boolean mask per loop."""
+    masks = aux.get("routing", [])
+    grouped = []
+    for start in range(0, len(masks), n_core):
+        block = masks[start:start + n_core]
+        if not block:
+            continue
+        merged = block[0].clone()
+        for m in block[1:]:
+            merged |= m
+        grouped.append(merged)                        # (tokens, experts) bool
+    return grouped
+
+
+@torch.no_grad()
+def expert_trajectories(model, eval_set, spec, loops: Optional[int] = None) -> Dict:
+    """T2: follow each token's expert set across loops, and ask when it settles.
+
+    Three quantities per loop transition, all cheap:
+
+    * **overlap** -- Jaccard between a token's expert set at loop t and t+1.
+      Under the fixed-point reading this should rise toward 1.
+    * **state move** -- ``||h_t - h_{t-1}|| / ||h_{t-1}||``, the actual
+      contraction. If routing convergence is a read-out of state convergence
+      (the linear-router argument of arXiv:2604.09780) these two curves are the
+      same curve.
+    * **settle step** -- the first loop after which a token's expert set never
+      changes again. Reported split by whether the token's answer was correct,
+      because the useful version of this is a difficulty signal: if hard
+      questions settle later, the expert path is a halting rule that costs a
+      set comparison rather than a softmax over the vocabulary.
+    """
+    model.eval()
+    positions = spec.answer_positions()
+    out = {}
+    for hop, (tokens, target, _) in eval_set.items():
+        _, aux = model(tokens, loops=loops, collect=True)
+        per_loop = _loop_masks(aux, model.cfg.n_core)
+        if len(per_loop) < 2:
+            continue
+        b, n = tokens.shape
+        width = n + model.cfg.registers
+
+        overlaps, moves = [], []
+        traces = aux.get("traces", [])
+        for t in range(1, len(per_loop)):
+            a, c = per_loop[t - 1], per_loop[t]
+            inter = (a & c).float().sum(1)
+            union = (a | c).float().sum(1).clamp_min(1)
+            overlaps.append((inter / union).mean().item())
+            if len(traces) > t:
+                delta = (traces[t] - traces[t - 1]).flatten(1).norm(dim=1)
+                base = traces[t - 1].flatten(1).norm(dim=1).clamp_min(1e-6)
+                moves.append((delta / base).mean().item())
+
+        # settle step per token: last loop at which the set changed
+        changed = torch.zeros(per_loop[0].shape[0])
+        for t in range(1, len(per_loop)):
+            differs = (per_loop[t] != per_loop[t - 1]).any(1).float()
+            changed = torch.where(differs > 0, torch.full_like(changed, t + 1.0),
+                                  changed)
+        settle = changed.view(b, width)[:, width - n:]        # drop registers
+        answer_settle = settle[:, positions]
+
+        logits, _ = model(tokens, loops=loops)
+        correct = (answer_logits(logits, positions).argmax(-1) == target)
+        out[f"overlap_h{hop}"] = overlaps
+        out[f"state_move_h{hop}"] = moves
+        out[f"settle_h{hop}"] = answer_settle.mean().item()
+        if correct.any():
+            out[f"settle_correct_h{hop}"] = answer_settle[correct].mean().item()
+        if (~correct).any():
+            out[f"settle_wrong_h{hop}"] = answer_settle[~correct].mean().item()
+        out[f"mean_k_h{hop}"] = float(
+            sum(m.float().sum(1).mean().item() for m in per_loop) / len(per_loop))
+    model.train()
+    return out
+
+
+def _modularity(adj: torch.Tensor, part: torch.Tensor) -> float:
+    """Newman modularity of a two-way split -- enough to say "modular or not"."""
+    m2 = adj.sum().clamp_min(1e-9)
+    deg = adj.sum(1)
+    same = (part.unsqueeze(0) == part.unsqueeze(1)).float()
+    expect = torch.outer(deg, deg) / m2
+    return float(((adj - expect) * same).sum() / m2)
+
+
+@torch.no_grad()
+def expert_graph(model, eval_set, spec, loops: Optional[int] = None) -> Dict:
+    """T5: the expert co-activation graph, per loop.
+
+    Nodes are experts, edge weights are how often two experts are selected for
+    the same token. Three read-outs per loop: the **spectral gap** of the
+    normalised Laplacian (how well connected the graph is), the **modularity**
+    of its spectral two-way split (whether experts form communities), and the
+    **effective number of experts** ``exp(H)``. The hypothesis this exists to
+    test is that accuracy tracks structure -- a graph split into coherent
+    communities -- rather than raw routing divergence, which would explain why
+    E3's `embed` arm diverged four times as much and scored worse.
+    """
+    model.eval()
+    out = {}
+    hop = sorted(eval_set)[0]
+    tokens = eval_set[hop][0]
+    _, aux = model(tokens, loops=loops, collect=True)
+    for t, mask in enumerate(_loop_masks(aux, model.cfg.n_core)):
+        m = mask.float()
+        adj = m.t() @ m                                  # co-activation counts
+        adj.fill_diagonal_(0)
+        deg = adj.sum(1)
+        if float(deg.sum()) == 0:
+            continue
+        inv = torch.where(deg > 0, deg.clamp_min(1e-9).pow(-0.5),
+                          torch.zeros_like(deg))
+        lap = torch.eye(adj.shape[0]) - inv.unsqueeze(1) * adj * inv.unsqueeze(0)
+        evals, evecs = torch.linalg.eigh(lap)
+        share = m.sum(0) / m.sum().clamp_min(1)
+        entropy = -(share * share.clamp_min(1e-12).log()).sum()
+        out[f"loop{t + 1}"] = {
+            "spectral_gap": float(evals[1]),
+            "modularity": _modularity(adj, (evecs[:, 1] > 0).long()),
+            "effective_experts": float(entropy.exp()),
+            "mean_k": float(m.sum(1).mean()),
+        }
+    model.train()
+    return out

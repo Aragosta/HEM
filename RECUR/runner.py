@@ -45,12 +45,24 @@ def execute(job: Dict) -> Dict:
         spec = HopSpec(two_chain=(task == "twochain"), **job.get("spec", {}))
         cfg = Config(vocab_size=spec.vocab_size, max_seq_len=spec.seq_len,
                      **overrides)
+        anneal = job.get("k_anneal")          # [k_start, k_end] over training
+        schedule = None
+        if anneal:
+            start, end = anneal
+
+            def schedule(progress, start=start, end=end):
+                # Decreasing-rate pruning: fast early elimination then a slow
+                # tail, the profile measured in cortex and reported to beat
+                # linear schedules (PLOS Comp Biol pcbi.1004347).
+                return round(end + (start - end) * (1.0 - progress) ** 3)
+
         result, _ = train_hops(cfg, spec, steps=job["steps"],
                                batch_size=job.get("batch", 32),
                                lr=job.get("lr", 2e-3),
                                data_seed=job.get("data_seed", 1234),
                                eval_every=job.get("eval_every", 0),
-                               eval_loops=tuple(job.get("eval_loops", ())))
+                               eval_loops=tuple(job.get("eval_loops", ())),
+                               k_schedule=schedule)
     elif task.startswith("bytes"):
         corpus = load_bytes(task.split(":")[1] if ":" in task else "wikitext2")
         cfg = Config(vocab_size=256, max_seq_len=job.get("seq_len", 128),

@@ -54,6 +54,9 @@ class Config:
     expert_ratio: float = 0.86         # d_ff / d_latent   (K3: 3072/3584)
     dense_ratio: float = 2.67          # d_ff / d_model when moe=False
     router_bias_lr: float = 1e-3       # aux-loss-free load balancing
+    route_mode: str = "topk"           # "topk" | "threshold" (local rewiring)
+    k_by_loop: Tuple[int, ...] = ()    # per-loop-position k; () = same k everywhere
+    tau_lr: float = 1e-2               # homeostatic threshold rate (threshold mode)
     attn_res: str = "full"             # "none" | "full"
     sandwich_norm: bool = True
 
@@ -188,6 +191,12 @@ class LatentMoE(nn.Module):
         nn.init.normal_(self.gate_w, std=dl ** -0.5)
         self.register_buffer("gate_bias", torch.zeros(cfg.n_routed))
         self.register_buffer("load", torch.zeros(cfg.n_routed))
+        # threshold routing: one threshold per expert, moved by a purely local
+        # activity rule. Initialised so that a token whose score is at the
+        # median selects about `n_active` of `n_routed` experts.
+        self.register_buffer("tau", torch.full((cfg.n_routed,), 0.5))
+        self.register_buffer("mean_k", torch.tensor(float(cfg.n_active)))
+        self.active_override: Optional[int] = None
         # experts as batched parameters: (E, dl, de) so top-k is a gather
         self.w_gate = nn.Parameter(torch.empty(cfg.n_routed, dl, de))
         self.w_up = nn.Parameter(torch.empty(cfg.n_routed, dl, de))
@@ -217,8 +226,23 @@ class LatentMoE(nn.Module):
         if self.step_bias is not None:
             logits = logits + self.step_bias[min(step, self.step_bias.shape[0] - 1)]
         scores = torch.sigmoid(logits)
-        idx = torch.topk(scores + self.gate_bias, self.n_active, dim=-1).indices
-        weight = torch.gather(scores, 1, idx)
+
+        k = self.k_at(step)
+        if cfg.route_mode == "threshold":
+            # Local rewiring: an expert takes a token when its score clears
+            # that expert's own threshold. No k is imposed -- the number of
+            # experts per token is an *output*, and the thresholds move by a
+            # local activity rule (see `homeostasis`). This is the
+            # activity-based add/delete rule from the self-organised
+            # criticality literature, applied to the expert graph.
+            mask = (scores + self.gate_bias) > self.tau
+            top1 = torch.argmax(scores + self.gate_bias, dim=-1, keepdim=True)
+            mask = mask.scatter(1, top1, True)          # never route to nothing
+        else:
+            idx = torch.topk(scores + self.gate_bias, k, dim=-1).indices
+            mask = torch.zeros_like(scores, dtype=torch.bool).scatter(1, idx, True)
+
+        weight = scores * mask
         weight = weight / weight.sum(-1, keepdim=True).clamp_min(1e-9)
 
         # Dispatch: one matmul per expert over the tokens routed to it. The
@@ -226,37 +250,59 @@ class LatentMoE(nn.Module):
         # is a page of tensor algebra and 100x the memory traffic; measured at
         # these shapes it was 20x slower.
         out = torch.zeros_like(flat)
-        flat_idx = idx.reshape(-1)
-        flat_w = weight.reshape(-1)
-        token_of = torch.arange(idx.shape[0], device=x.device
-                                ).repeat_interleave(self.n_active)
-        order = torch.argsort(flat_idx)
-        counts = torch.bincount(flat_idx, minlength=self.n_routed).tolist()
-        start = 0
-        for e, n_e in enumerate(counts):
-            if n_e == 0:
+        for e in range(self.n_routed):
+            rows = mask[:, e].nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
                 continue
-            sel = order[start:start + n_e]
-            start += n_e
-            rows = token_of[sel]
             z_e = flat[rows]
             h_e = F.silu(z_e @ self.w_gate[e]) * (z_e @ self.w_up[e])
-            out.index_add_(0, rows, (h_e @ self.w_down[e]) * flat_w[sel].unsqueeze(-1))
+            out.index_add_(0, rows,
+                           (h_e @ self.w_down[e]) * weight[rows, e].unsqueeze(-1))
 
         if cfg.n_shared:
             out = out + self.s_down(F.silu(self.s_gate(flat)) * self.s_up(flat))
 
         with torch.no_grad():
-            counts = torch.zeros_like(self.load)
-            counts.scatter_add_(0, idx.reshape(-1),
-                                torch.ones(idx.numel(), device=x.device))
-            self.load.mul_(0.9).add_(0.1 * counts / max(1, idx.shape[0]))
-        return self.up(out.view_as(z)), idx, scores
+            share = mask.float().mean(0)               # fraction of tokens per expert
+            self.load.mul_(0.9).add_(0.1 * share)
+            self.mean_k.mul_(0.9).add_(0.1 * mask.float().sum(1).mean())
+        return self.up(out.view_as(z)), mask, scores
+
+    def k_at(self, step: int) -> int:
+        """Experts per token at this loop position.
+
+        Three sources, in order: a harness-set override (used by the annealing
+        schedules in T3), a per-loop-position table (`k_by_loop`, the
+        wide-entry/narrow-refinement schedule), then the config's `n_active`.
+        """
+        if self.active_override is not None:
+            return max(1, min(self.n_routed, int(self.active_override)))
+        if self.cfg.k_by_loop:
+            table = self.cfg.k_by_loop
+            return max(1, min(self.n_routed, table[min(step, len(table) - 1)]))
+        return self.n_active
+
+    @torch.no_grad()
+    def homeostasis(self):
+        """Local add/delete rule for threshold routing.
+
+        Each expert raises its own threshold when it has been firing more than
+        its share and lowers it when firing less, using only its own activity.
+        Nothing here knows the target sparsity of the layer, let alone the
+        network: the average number of experts per token is an emergent
+        quantity, which is the property the criticality literature cares about.
+        """
+        target = self.cfg.n_active / self.n_routed
+        self.tau.add_(self.cfg.tau_lr * (self.load - target))
+        self.tau.clamp_(0.05, 0.95)
 
     @torch.no_grad()
     def rebalance(self):
-        """Aux-loss-free step: push the bias toward equal expert load."""
-        target = self.load.mean()
+        """One optimiser step's worth of routing housekeeping."""
+        if self.cfg.route_mode == "threshold":
+            self.homeostasis()
+            return
+        target = self.load.mean()                    # aux-loss-free balancing
         self.gate_bias.add_(self.cfg.router_bias_lr *
                             torch.sign(target - self.load))
 
@@ -271,6 +317,9 @@ class DenseFFN(nn.Module):
 
     def forward(self, x, step: int = 0):
         return self.down(F.silu(self.gate(x)) * self.up(x)), None, None
+
+    def k_at(self, step: int) -> int:                  # parity with LatentMoE
+        return 0
 
 
 class Block(nn.Module):
