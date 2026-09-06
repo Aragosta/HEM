@@ -18,13 +18,13 @@ are in §6.
 | T1b | depth substitutes for active width at matched FLOPs | **weakly held** — R=2/k=2 beats R=1/k=8 at both hop counts (0.590 vs 0.544; 0.625 vs 0.586), one of the two outside its seed spread |
 | T1c | k\* > 2 at 3 hops | **not supported** — k=2 wins at R=1 and k=4 at R=2, both inside noise |
 | T3a | overproduce-then-prune ≥ constant-k | **directionally yes, not significant** — anneal +0.039 over k2 on paired seeds, but per-seed −0.044 / +0.122 |
-| T3b | wide-entry/narrow-refinement ≥ annealing | **not supported** — phase +0.011, and its k schedule leaked (§6) |
+| T3b | wide-entry/narrow-refinement ≥ annealing | **not supported at R=2 with the leaking schedule; supported once fixed** — with the schedule confined to the core and four loops, `phase` scores 0.668 against `base` 0.608 (n=2) |
 | T3c | k=8 is not the best arm | **failed** — k=8 was nominally best (0.674), though inside noise and at 1.4× the FLOPs |
 | T4a | local rewiring lands within noise of top-k | **held** — 0.574 vs 0.590 at 2 hops, 0.640 vs 0.625 at 3 hops |
-| T4b | emergent experts/token declines across loops | **weakly held** — declines in 3 of 4 local runs (6.53→5.16, 5.44→4.52, 5.92→3.83), flat in the fourth |
+| T4b | emergent experts/token declines across loops | **failed at R=4** — the unconditioned and `bias` arms are flat to three decimals across four loops (3.74–3.81), and `local` declines only in one seed. The R=2 hint was noise |
 | T4c | emergent k rises with task complexity | **weakly held** — 2.66 at 2 hops, 2.78 at 3 hops, and both above the 2.0 we imposed |
-| T2a | routing convergence tracks state convergence | **untestable as run** — R=2 gives one transition; a curve needs more than one point (§6) |
-| T2b | wrong answers settle later | **consistent but tiny** — +0.036, +0.039, +0.029 across the three families, on a scale saturated by having only two loops |
+| T2a | routing convergence tracks state convergence | **held, strongly** — at R=4 the two curves move together over every transition; r = −0.877 across 24 transitions (−0.843 excluding the one diverging run) |
+| T2b | wrong answers settle later | **failed at R=4** — −0.044, +0.010, −0.028, −0.008 across the four arms. The R=2 signal was an artefact of a two-valued scale, and with it goes T2c, the cheap halting rule |
 | T5a | accuracy tracks graph structure, not divergence | **not supported** — over 48 runs, r = +0.17 (spectral gap), −0.18 (modularity), +0.11 (effective experts); none significant at n=48 |
 | T5b | effective experts ≪ nominal (redundancy) | **failed, and interestingly** — 15.29 of 16, i.e. near-perfectly uniform usage |
 
@@ -33,6 +33,36 @@ are in §6.
 ## 1. T1 — active experts × complexity × depth
 
 <!-- filled by: python t1_sparsity_depth.py --report-only -->
+
+## 2-hop composition (accuracy)
+
+| loops | k=1 | k=2 | k=4 | k=8 | best k |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.585 ± 0.004 | 0.548 ± 0.015 | 0.574 ± 0.076 | 0.544 ± 0.036 | **1** |
+| 2 | 0.559 ± 0.014 | 0.590 ± 0.049 | 0.571 ± 0.035 | 0.599 ± 0.038 | **8** |
+
+## 3-hop composition (accuracy)
+
+| loops | k=1 | k=2 | k=4 | k=8 | best k |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.581 ± 0.050 | 0.692 ± 0.037 | 0.593 ± 0.078 | 0.586 ± 0.111 | **2** |
+| 2 | 0.655 ± 0.002 | 0.625 ± 0.006 | 0.682 ± 0.081 | 0.674 ± 0.099 | **4** |
+
+## iso-compute: is depth a substitute for active experts?
+
+Cells with comparable forward FLOPs per token, so the question is where a fixed budget should go.
+
+| hops | arm | FLOPs/token | accuracy |
+| --- | --- | --- | --- |
+| 2 | R=1, k=4 | 3.27e+05 | 0.574 ± 0.076 |
+| 2 | R=2, k=2 | 4.33e+05 | 0.590 ± 0.049 |
+| 2 | R=1, k=8 | 4.13e+05 | 0.544 ± 0.036 |
+| 2 | R=2, k=4 | 4.98e+05 | 0.571 ± 0.035 |
+| 3 | R=1, k=4 | 3.27e+05 | 0.593 ± 0.078 |
+| 3 | R=2, k=2 | 4.34e+05 | 0.625 ± 0.006 |
+| 3 | R=1, k=8 | 4.13e+05 | 0.586 ± 0.111 |
+| 3 | R=2, k=4 | 4.98e+05 | 0.682 ± 0.081 |
+
 
 ## 2-hop composition (accuracy)
 
@@ -109,9 +139,58 @@ From the co-activation record of the final model: the mean number of experts eac
 | 3 | local | 1 | 5.92 | 3.83 |
 
 
+## experts per token by loop position (T4b)
+
+From the co-activation record of the final model: the mean number of experts each token activates at loop 1 and loop 2. A declining profile is the wide-entry / narrow-refinement pattern that E3 found by conditioning the router, arrived at here by a local rule that knows nothing about loops.
+
+| hops | arm | seed | loop 1 | loop 2 |
+| --- | --- | --- | --- | --- |
+| 2 | topk | 0 | 3.85 | 3.54 |
+| 2 | topk | 1 | 3.66 | 3.83 |
+| 2 | local | 0 | 6.53 | 5.16 |
+| 2 | local | 1 | 5.44 | 4.52 |
+| 3 | topk | 0 | 3.79 | 3.71 |
+| 3 | topk | 1 | 3.78 | 3.73 |
+| 3 | local | 0 | 5.93 | 6.04 |
+| 3 | local | 1 | 5.92 | 3.83 |
+
+
 ## 4. T2 — expert trajectories
 
 <!-- filled by: python t2_trajectories.py --report-only -->
+
+## does routing convergence track state convergence? (T2a)
+
+| run | loop | expert-set overlap | relative state move |
+| --- | --- | --- | --- |
+| t1_h2_R2_k1_s0 | 1->2 | 0.306 | 0.627 |
+| t1_h2_R2_k1_s1 | 1->2 | 0.213 | 0.751 |
+| t1_h2_R2_k2_s0 | 1->2 | 0.285 | 0.733 |
+| t1_h2_R2_k2_s1 | 1->2 | 0.314 | 0.668 |
+| t1_h2_R2_k4_s0 | 1->2 | 0.512 | 0.666 |
+| t1_h2_R2_k4_s1 | 1->2 | 0.526 | 0.778 |
+| t1_h2_R2_k8_s0 | 1->2 | 0.747 | 0.533 |
+| t1_h2_R2_k8_s1 | 1->2 | 0.659 | 0.884 |
+| t1_h3_R2_k1_s0 | 1->2 | 0.286 | 0.714 |
+| t1_h3_R2_k1_s1 | 1->2 | 0.282 | 0.693 |
+| t1_h3_R2_k2_s0 | 1->2 | 0.416 | 0.809 |
+| t1_h3_R2_k2_s1 | 1->2 | 0.342 | 0.684 |
+
+## do wrong answers settle later? (T2b)
+
+| family | mean settle step (correct) | (wrong) | difference | n runs |
+| --- | --- | --- | --- | --- |
+| t1 | 1.827 | 1.864 | +0.036 | 16 |
+| t3 | 1.845 | 1.884 | +0.039 | 8 |
+| t4 | 1.847 | 1.876 | +0.029 | 8 |
+
+## settle step by task complexity
+
+| hops | loops | mean settle step | mean experts/token | n |
+| --- | --- | --- | --- | --- |
+| 2 | 2 | 1.863 | 5.68 | 12 |
+| 3 | 2 | 1.842 | 6.14 | 20 |
+
 
 ## does routing convergence track state convergence? (T2a)
 
@@ -185,11 +264,47 @@ From the co-activation record of the final model: the mean number of experts eac
 Effective experts: mean 15.29 of a pool of 16 (T5b).
 
 
+## structure per loop (first 14 runs)
+
+| run | loop | spectral gap | modularity | effective experts | experts/token |
+| --- | --- | --- | --- | --- | --- |
+| t1_h2_R1_k1_s0 | loop1 | 0.514 | 0.155 | 15.91 | 1.94 |
+| t1_h2_R1_k1_s1 | loop1 | 0.468 | 0.184 | 15.93 | 1.95 |
+| t1_h2_R1_k2_s0 | loop1 | 0.585 | 0.168 | 15.93 | 3.71 |
+| t1_h2_R1_k2_s1 | loop1 | 0.787 | 0.068 | 15.90 | 3.74 |
+| t1_h2_R1_k4_s0 | loop1 | 0.745 | 0.090 | 15.75 | 7.07 |
+| t1_h2_R1_k4_s1 | loop1 | 0.780 | 0.067 | 15.95 | 7.03 |
+| t1_h2_R1_k8_s0 | loop1 | 0.993 | -0.013 | 15.91 | 12.36 |
+| t1_h2_R1_k8_s1 | loop1 | 0.977 | -0.004 | 15.90 | 11.71 |
+| t1_h2_R2_k1_s0 | loop1 | 0.474 | 0.192 | 15.39 | 1.95 |
+| t1_h2_R2_k1_s0 | loop2 | 0.420 | 0.200 | 15.52 | 1.92 |
+| t1_h2_R2_k1_s1 | loop1 | 0.659 | 0.109 | 14.36 | 1.93 |
+| t1_h2_R2_k1_s1 | loop2 | 0.564 | 0.159 | 14.26 | 1.89 |
+| t1_h2_R2_k2_s0 | loop1 | 0.757 | 0.047 | 14.20 | 3.85 |
+| t1_h2_R2_k2_s0 | loop2 | 0.736 | 0.090 | 14.22 | 3.54 |
+| t1_h2_R2_k2_s1 | loop1 | 0.555 | 0.182 | 15.02 | 3.66 |
+| t1_h2_R2_k2_s1 | loop2 | 0.749 | 0.102 | 15.35 | 3.83 |
+| t1_h2_R2_k4_s0 | loop1 | 0.919 | 0.006 | 15.74 | 6.81 |
+| t1_h2_R2_k4_s0 | loop2 | 0.765 | 0.088 | 15.76 | 6.78 |
+| t1_h2_R2_k4_s1 | loop1 | 0.833 | 0.042 | 15.69 | 6.97 |
+| t1_h2_R2_k4_s1 | loop2 | 0.837 | 0.056 | 15.69 | 7.23 |
+
+## does structure predict accuracy? (T5a)
+
+- runs compared: 48
+- corr(accuracy, spectral gap) = +0.166
+- corr(accuracy, modularity) = -0.175
+- corr(accuracy, effective experts) = +0.105
+
+Effective experts: mean 15.29 of a pool of 16 (T5b).
+
+
 ## 6. What went wrong, and what it would take to fix
 
 Two of the five nulls are design errors, and both were mine.
 
-**T2 was run at a depth that cannot answer it.** T1, T3 and T4 all used R=2 to
+**T2 was run at a depth that cannot answer it** (fixed, and the fix changed two
+verdicts: T2a from untestable to held, T2b from "consistent" to failed). T1, T3 and T4 all used R=2 to
 keep 48 runs affordable. That leaves one loop transition, so "does the expert
 path converge" has no curve to look at and "does it settle later on hard
 questions" is measured on a scale with two values. `t2b_depth4.py` fixes it at
