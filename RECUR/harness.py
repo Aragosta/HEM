@@ -90,9 +90,18 @@ def halting_loss(aux: Dict, per_step_loss: List[torch.Tensor], cfg: Config):
 # ------------------------------------------------------------------- runners
 
 def _optimizer(model, lr, weight_decay=0.01):
+    """AdamW, with the temperature exempt from weight decay.
+
+    ``log_beta`` is 2-D, so the usual "decay matrices, spare vectors" rule
+    would decay it -- and decaying a log-parameter pulls it toward 0, i.e. the
+    multiplier toward 1.0. That is not regularisation, it is the optimiser
+    quietly holding the temperature at the baseline and answering the question
+    the experiment is asking. (The same trap is recorded in
+    ``CALM/CRITICALITY.md``, found the same way.)
+    """
     decay, no_decay = [], []
     for n, p in model.named_parameters():
-        (no_decay if p.ndim < 2 else decay).append(p)
+        (no_decay if p.ndim < 2 or n.endswith("log_beta") else decay).append(p)
     return torch.optim.AdamW([
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0}], lr=lr, betas=(0.9, 0.95))
@@ -220,6 +229,33 @@ def evaluate_kl_exit(model, eval_set, spec, loops: int,
 
 
 @torch.no_grad()
+@torch.no_grad()
+def attention_entropy(model, tokens, loops: Optional[int] = None):
+    """Per-loop attention entropy, the order parameter of the phase diagram.
+
+    Reported normalised by ``log(#visible keys)``: 1.0 is uniform attention
+    (the disordered phase, where a head outputs an average), 0.0 is a hard
+    argmax (the frozen phase, where it copies one token). The question this
+    exists to answer is whether the entropy *falls across loops* -- whether a
+    weight-shared head, run repeatedly on a contracting state, walks itself out
+    of the useful regime. If it does, depth saturation is a head freezing, not
+    only a state converging, and the two have different fixes.
+    """
+    from model import Attention
+    heads = [m for m in model.modules() if isinstance(m, Attention)]
+    for h in heads:
+        h.record = True
+    model.eval()
+    try:
+        _, aux = model(tokens, loops=loops, collect=True)
+    finally:
+        for h in heads:
+            h.record = False
+        model.train()
+    per_loop = aux.get("attention_entropy") or []
+    return [sum(x) / len(x) for x in per_loop if x and None not in x]
+
+
 def set_active_experts(model, k: int) -> None:
     """Override every MoE layer's k for the next forward pass."""
     from model import LatentMoE
@@ -340,6 +376,8 @@ def train_hops(cfg: Config, spec: HopSpec, steps: int, batch_size: int = 64,
         "by_depth": by_depth, "exits": exits,
         "routing_hist": routing_histograms(model, eval_set[spec.hops[0]][0][:64]),
         "trajectories": expert_trajectories(model, eval_set, spec),
+        "attention_entropy": attention_entropy(
+            model, eval_set[spec.hops[0]][0][:64]),
         "expert_graph": expert_graph(model, eval_set, spec),
         "routing_state": routing_state(model),
         "expert_load": [l.tolist() for l in model.expert_load()],

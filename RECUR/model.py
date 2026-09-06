@@ -58,6 +58,13 @@ class Config:
     k_by_loop: Tuple[int, ...] = ()    # per-loop-position k; () = same k everywhere
     tau_lr: float = 1e-2               # homeostatic threshold rate (threshold mode)
     attn_res: str = "full"             # "none" | "full"
+    # --- attention temperature (the statistical-mechanics knob) -------------
+    # A head computes softmax(beta * q.k); beta = 1/sqrt(head_dim) by default,
+    # which is a variance-normalising constant that nobody chose as a
+    # temperature. `beta_scale` multiplies it; `beta_mode` decides whether the
+    # multiplier is fixed, learned per head, or learned per (loop, head).
+    beta_mode: str = "fixed"           # "fixed" | "learned" | "per_loop"
+    beta_scale: float = 1.0
     sandwich_norm: bool = True
 
     # --- recurrence --------------------------------------------------------
@@ -139,24 +146,75 @@ class Attention(nn.Module):
     long context and would be untestable at this scale. See ``BASELINE.md``.
     """
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, max_steps: int = 1):
         super().__init__()
+        self.cfg = cfg
         self.heads = cfg.n_heads
         self.qkv = nn.Linear(cfg.dim, 3 * cfg.dim, bias=False)
         self.out = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        self.record = False                 # entropy costs an explicit softmax
+        self.last_entropy: Optional[float] = None
+        steps = max_steps if cfg.beta_mode == "per_loop" else 1
+        if cfg.beta_mode == "fixed":
+            self.log_beta = None
+        else:
+            # zero-init in log space: step 0 is bit-identical to 1/sqrt(d), so
+            # a learned-temperature arm starts from the standard model rather
+            # than from a different one.
+            self.log_beta = nn.Parameter(torch.zeros(steps, cfg.n_heads))
 
-    def forward(self, x: torch.Tensor, rotary, attn_mask=None) -> torch.Tensor:
+    def beta_factor(self, step: int) -> Optional[torch.Tensor]:
+        if self.log_beta is None:
+            return None
+        row = self.log_beta[min(step, self.log_beta.shape[0] - 1)]
+        return row.exp().view(1, -1, 1, 1)
+
+    def forward(self, x: torch.Tensor, rotary, attn_mask=None,
+                step: int = 0) -> torch.Tensor:
         b, n, d = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         shape = (b, n, self.heads, d // self.heads)
         q, k, v = (t.view(shape).transpose(1, 2) for t in (q, k, v))
         if rotary is not None:
             q, k = apply_rotary(q, rotary), apply_rotary(k, rotary)
+        # softmax(beta*q.k) == softmax((c*q).k) with beta scaled by c, so the
+        # temperature is applied to the queries and SDPA stays on its fast path.
+        factor = self.beta_factor(step)
+        scale = self.cfg.beta_scale
+        if factor is not None:
+            q = q * factor
+        if scale != 1.0:
+            q = q * scale
+        if self.record:
+            self._record_entropy(q, k, attn_mask, n)
         if attn_mask is None:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return self.out(y.transpose(1, 2).reshape(b, n, d))
+
+    @torch.no_grad()
+    def _record_entropy(self, q, k, attn_mask, n: int) -> None:
+        """Attention entropy, normalised by log(#visible keys).
+
+        1.0 means the head attends uniformly over everything it can see -- the
+        disordered phase, where the output is an average and carries no
+        information. 0.0 means it has collapsed onto a single key -- the frozen
+        phase. The useful regime is in between, and this is the order parameter
+        that says which one a head is in.
+        """
+        scale = q.shape[-1] ** -0.5
+        logits = (q @ k.transpose(-1, -2)) * scale
+        if attn_mask is None:
+            causal = torch.ones(n, n, dtype=torch.bool, device=q.device).tril()
+            mask = causal.view(1, 1, n, n)
+        else:
+            mask = attn_mask
+        logits = logits.masked_fill(~mask, float("-inf"))
+        probs = logits.softmax(-1)
+        ent = -(probs * probs.clamp_min(1e-12).log()).sum(-1)
+        visible = mask.expand(1, 1, n, n).float().sum(-1).clamp_min(2)
+        self.last_entropy = float((ent / visible.log()).mean())
 
 
 class LatentMoE(nn.Module):
@@ -330,7 +388,7 @@ class Block(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.attn_norm = nn.RMSNorm(cfg.dim, eps=1e-5)
-        self.attn = Attention(cfg)
+        self.attn = Attention(cfg, max_steps)
         self.mlp_norm = nn.RMSNorm(cfg.dim, eps=1e-5)
         self.mlp = (LatentMoE(cfg, max_steps, is_core=is_core) if cfg.moe
                     else DenseFFN(cfg, max_steps))
@@ -343,7 +401,7 @@ class Block(nn.Module):
         """``stream`` is the residual mechanism; it decides what each sublayer
         reads and records what it wrote."""
         h = stream.read(self.attn_norm, kind="attn", step=step)
-        a = self.attn(h, rotary, attn_mask)
+        a = self.attn(h, rotary, attn_mask, step=step)
         if self.post_attn is not None:
             a = self.post_attn(a)
         stream.write(a)
@@ -507,9 +565,14 @@ class Recurrent(nn.Module):
                                   .digest(), "little")) % (2 ** 31)
             g = torch.Generator().manual_seed(key)
             with torch.no_grad():
-                if name.endswith("queries") or "exit_gate" in name or \
-                        name.endswith("bias"):
-                    p.zero_()                      # AttnRes and the gate start neutral
+                if name.endswith(("queries", "log_beta")) or "exit_gate" in name \
+                        or name.endswith("bias"):
+                    # AttnRes queries, the halting gate and the temperature all
+                    # start neutral, so an arm that adds one of them is
+                    # bit-identical to the baseline at step 0 and any later
+                    # difference is something the model learned, not something
+                    # the initialiser did.
+                    p.zero_()
                 elif p.ndim == 1:
                     p.fill_(1.0)                   # RMSNorm scales
                 elif name == "embed.weight":
@@ -576,7 +639,7 @@ class Recurrent(nn.Module):
             state = torch.randn(state.shape, generator=g, device=state.device,
                                 dtype=state.dtype) * 0.02
 
-        step_logits, traces, halt = [], [], []
+        step_logits, traces, halt, entropies = [], [], [], []
         cut = R - cfg.backprop_loops if cfg.backprop_loops else 0
         routing: List[torch.Tensor] = []
         persistent = cfg.loop_memory == "attn_res" and cfg.attn_res == "full"
@@ -609,6 +672,8 @@ class Recurrent(nn.Module):
                 idx, _ = blk(loop_stream, rotary, step=r, attn_mask=attn_mask)
                 if idx is not None and collect:
                     routing.append(idx.detach())
+            if collect and self.core and self.core[0].attn.record:
+                entropies.append([blk.attn.last_entropy for blk in self.core])
             state = loop_stream.final()
             if collect:
                 traces.append(state.detach())
@@ -624,6 +689,7 @@ class Recurrent(nn.Module):
         if collect:
             aux["traces"] = traces
             aux["routing"] = routing
+            aux["attention_entropy"] = entropies
         return logits, aux
 
     def _decode(self, state, rotary, attn_mask, n: int):
