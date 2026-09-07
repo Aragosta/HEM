@@ -177,6 +177,39 @@ def reachability(graph: Graph, n: int, depth: int) -> float:
     return reached / total
 
 
+def reach_by_distance(graph: Graph, n: int, depth: int,
+                      bands=((1, 4), (5, 16), (17, 48), (49, 127))) -> Dict[str, float]:
+    """Reachability split by separation |q - k|, which is where the mechanism is.
+
+    A causal graph has an asymmetry an undirected one does not: to reach the
+    token immediately before you, a DIRECT edge is the only option, because any
+    detour would have to pass through a position strictly between them and there
+    is none. Near pairs therefore have exactly one route and far pairs have many.
+    That makes local band edges irreplaceable and long-range edges substitutable,
+    which is why deleting the band (p=1) destroys short-range reachability while
+    leaving long-range reachability almost untouched.
+    """
+    hits = {band: [0, 0] for band in bands}
+    for source in range(n):
+        seen = {source}
+        frontier = deque([(source, 0)])
+        while frontier:
+            node, distance = frontier.popleft()
+            if distance == depth:
+                continue
+            for neighbour in graph[node]:
+                if neighbour not in seen:
+                    seen.add(neighbour)
+                    frontier.append((neighbour, distance + 1))
+        for key in range(source):
+            separation = source - key
+            for band in bands:
+                if band[0] <= separation <= band[1]:
+                    hits[band][1] += 1
+                    hits[band][0] += key in seen
+    return {f"reach_{a}_{b}": h[0] / max(h[1], 1) for (a, b), h in hits.items()}
+
+
 def spectral_gap(graph: Graph, n: int) -> float:
     import torch
     adjacency = torch.zeros(n, n)
@@ -237,8 +270,8 @@ def main():
     masks["bigbird"] = bigbird(n, w - 6, 3, 3, budget, options.seed)
     masks["modular"] = modular(n, 2 * w, budget, options.seed)
 
-    print(f"    {'mask':>14s} {'edges':>7s} {'zlib B':>7s} {'reach@' + str(depth):>9s} "
-          f"{'gap':>7s} {'clust':>7s} {'degCV':>7s}")
+    print(f"    {'mask':>14s} {'zlib B':>7s} {'reach':>7s} "
+          f"{'near':>7s} {'window':>7s} {'mid':>7s} {'far':>7s} {'gap':>7s}")
     rows = []
     for name, graph in masks.items():
         assert edge_count(graph) == budget, f"{name} broke the edge budget"
@@ -247,14 +280,16 @@ def main():
             "edges": edge_count(graph),
             "zlib_bytes": compressed_bytes(graph, n),
             "reach": reachability(graph, n, depth),
+            **reach_by_distance(graph, n, depth),
             "spectral_gap": spectral_gap(graph, n),
             "clustering": clustering(graph, n),
             "degree_cv": degree_cv(graph, n),
         }
         rows.append(row)
-        print(f"    {name:>14s} {row['edges']:7d} {row['zlib_bytes']:7d} "
-              f"{row['reach']:9.4f} {row['spectral_gap']:7.4f} "
-              f"{row['clustering']:7.4f} {row['degree_cv']:7.4f}")
+        print(f"    {name:>14s} {row['zlib_bytes']:7d} {row['reach']:7.3f} "
+              f"{row['reach_1_4']:7.3f} {row['reach_5_16']:7.3f} "
+              f"{row['reach_17_48']:7.3f} {row['reach_49_127']:7.3f} "
+              f"{row['spectral_gap']:7.4f}")
 
     sweep = [r for r in rows if r["mask"].startswith("p=")]
     sizes = [r["zlib_bytes"] for r in sweep]
