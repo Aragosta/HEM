@@ -967,3 +967,96 @@ and stop being budgeted as GPU work.**
 Two registered predictions failed (T8's capacity trend, T11's Q4). Both failures
 were more informative than the corresponding passes, and neither would have been
 visible from the design document.
+
+
+---
+
+# Reachability bound — does R_L(t) predict what a model can learn?
+
+`TOPOLOGY.md` §3.1, run as `suite/reachability_bound.py`. 6 masks × 3 seeds ×
+1200 steps, seq 128, 4 layers, dim 128, K=32 classes, probe-only loss, 77 min.
+
+The first experiment in this project where theory makes a **point prediction with
+no free parameters**: if the answer's position is outside the structural
+dependency closure `R_L(t)`, then top-1 accuracy is at most `1/K = 0.0312` and
+cross-entropy at least `log K = 3.466` nats, for *any* parameters.
+
+## R1 — the bound holds, and the cross-entropy version holds tightly
+
+`window16` at d=100 is the cell with zero reachable sources:
+
+| seed | accuracy (bound 0.0312) | cross-entropy (bound 3.466) |
+|---|---|---|
+| 0 | 0.0312 | 3.484 |
+| 1 | 0.0449 | **3.467** |
+| 2 | 0.0254 | 3.538 |
+
+**The cross-entropy bound is satisfied in all three seeds, and in seed 1 it is
+tight to 0.001 nats.** The model is pinned to the theoretical floor: it cannot
+do better, and it gets exactly that close to not doing worse.
+
+Seed 1's accuracy sits 0.014 above `1/K`, which is 1.8σ on 512 probes at
+p=0.031 — sampling noise on a statistic that only has to hold in expectation,
+and the CE figure for that same run is the sharp test. `winglobal` at d=60/100
+has *partial* reach (0.060, 0.148), so its applicable ceiling is ≈0.17 rather
+than 1/K, and its 0.045/0.082 sit under it.
+
+**This is the strongest result in the topology thread.** Every other number here
+is a comparison inside a noise floor; this one is a ceiling that a wrong graph
+computation would have visibly broken.
+
+## R2 — the task is learnable
+
+Full attention: 0.886–0.900 across all five distances, so the other rows can be
+read at all.
+
+## R3/R4 — not resolvable, and the reason is more interesting than the ranking
+
+Per-seed mean accuracy over cells whose source is reachable:
+
+| mask | edges | seed 0 | seed 1 | seed 2 | mean | **sd** |
+|---|---|---|---|---|---|---|
+| full | 33024 | 0.679 | 1.000 | 1.000 | 0.893 | 0.185 |
+| sw0.03 | 8160 | 1.000 | 0.444 | 0.571 | 0.672 | 0.291 |
+| hubs16 | 7800 | 0.857 | 0.627 | 0.025 | 0.503 | **0.429** |
+| window16 | 8160 | 1.000 | 0.024 | 0.272 | 0.432 | **0.507** |
+| layered | 2718 | 0.085 | 0.609 | 0.235 | 0.310 | 0.270 |
+| winglobal | 8160 | 0.028 | 0.412 | 0.138 | 0.193 | 0.198 |
+
+The means suggest a clean ranking. The seed columns say it is noise: `window16`
+scores 1.000 and 0.024 on the same mask, and `hubs16` 0.857 and 0.025. Of 18
+runs, **4 essentially failed (<0.10), 5 solved it (>0.80), and 9 landed in
+between** — a bimodal outcome, which is what a copy circuit that either forms or
+does not within the step budget looks like.
+
+So **R4 is not tested by this run.** `layered` at 0.33× the edges scores below
+`sw0.03`, but with per-seed values of 0.085/0.609/0.235 against
+1.000/0.444/0.571 there is no difference to report at 3 seeds.
+
+**The one signal that survives the noise is not about topology.** `full` is the
+only mask whose worst seed is above 0.6; every sparse mask has at least one
+near-total failure. Offered as a hypothesis and not a result: **sparsity may cost
+trainability more than it costs expressivity** — the masks that can represent the
+solution often fail to find it. That is a different claim from anything in
+`TOPOLOGY.md`, it would be invisible to every graph metric there, and it is
+testable by counting convergence events rather than averaging accuracy.
+
+## What this run establishes, precisely
+
+1. Structural dependency closure predicts a **hard ceiling** on what training can
+   find, confirmed to 0.001 nats. The graph analysis in `TOPOLOGY.md` §2 rests on
+   a computation that is now checked against a trained model.
+2. Nothing about which reachable mask is *better*. That needs ~15 seeds at this
+   variance, which is 4 CPU-hours — the same "more seeds beat more steps"
+   conclusion T2 reached, arrived at independently.
+3. A new question worth more than the original one: does sparse masking impair
+   optimisation independently of expressivity?
+
+## Method limits
+
+* **lr was not swept for this task.** 3e-3 was carried over from the LM suite and
+  the loss was visibly noisy at it. Some of the bimodality is plausibly an
+  optimisation artefact rather than a property of the masks.
+* Probe-only loss on a synthetic copy task. It isolates reachability by design
+  and says nothing about language modelling.
+* seq 128, 4 layers, 1200 steps.

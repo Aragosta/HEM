@@ -1,0 +1,783 @@
+{
+ "config": {
+  "steps": 1200,
+  "dim": 128,
+  "layers": 4,
+  "head_dim": 32,
+  "seq_len": 128,
+  "batch": 32,
+  "classes": 32,
+  "lr": 0.003,
+  "seeds": "0,1,2",
+  "eval_batches": 16,
+  "device": "cpu",
+  "smoke": false,
+  "out": "CALM/suite/reachability_results.json"
+ },
+ "coverage": {
+  "full": {
+   "2": 1.0,
+   "8": 1.0,
+   "24": 1.0,
+   "60": 1.0,
+   "100": 1.0
+  },
+  "window16": {
+   "2": 1.0,
+   "8": 1.0,
+   "24": 1.0,
+   "60": 1.0,
+   "100": 0.0
+  },
+  "sw0.03": {
+   "2": 1.0,
+   "8": 1.0,
+   "24": 1.0,
+   "60": 1.0,
+   "100": 1.0
+  },
+  "winglobal": {
+   "2": 1.0,
+   "8": 1.0,
+   "24": 1.0,
+   "60": 0.05970149253731343,
+   "100": 0.14814814814814814
+  },
+  "hubs16": {
+   "2": 1.0,
+   "8": 1.0,
+   "24": 1.0,
+   "60": 1.0,
+   "100": 1.0
+  },
+  "layered": {
+   "2": 1.0,
+   "8": 1.0,
+   "24": 1.0,
+   "60": 1.0,
+   "100": 1.0
+  }
+ },
+ "rows": [
+  {
+   "seed": 0,
+   "mask": "full",
+   "distance": 2,
+   "accuracy": 0.658203125,
+   "ce": 0.8732243925333023,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "full",
+   "distance": 8,
+   "accuracy": 0.67578125,
+   "ce": 0.834911622107029,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "full",
+   "distance": 24,
+   "accuracy": 0.66796875,
+   "ce": 0.9228507503867149,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "full",
+   "distance": 60,
+   "accuracy": 0.693359375,
+   "ce": 0.8689871206879616,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "full",
+   "distance": 100,
+   "accuracy": 0.69921875,
+   "ce": 0.8914215471595526,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "window16",
+   "distance": 2,
+   "accuracy": 1.0,
+   "ce": 0.00100376679256442,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "window16",
+   "distance": 8,
+   "accuracy": 1.0,
+   "ce": 0.0010166354004468303,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "window16",
+   "distance": 24,
+   "accuracy": 1.0,
+   "ce": 0.0013146136770956218,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "window16",
+   "distance": 60,
+   "accuracy": 1.0,
+   "ce": 0.0014146653411444277,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "window16",
+   "distance": 100,
+   "accuracy": 0.03125,
+   "ce": 3.4843171536922455,
+   "reachable_frac": 0.0
+  },
+  {
+   "seed": 0,
+   "mask": "sw0.03",
+   "distance": 2,
+   "accuracy": 1.0,
+   "ce": 0.0006003712151141372,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "sw0.03",
+   "distance": 8,
+   "accuracy": 1.0,
+   "ce": 0.0005786389792774571,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "sw0.03",
+   "distance": 24,
+   "accuracy": 1.0,
+   "ce": 0.0006897055318404455,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "sw0.03",
+   "distance": 60,
+   "accuracy": 1.0,
+   "ce": 0.0006577880649274448,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "sw0.03",
+   "distance": 100,
+   "accuracy": 1.0,
+   "ce": 0.0008075011792243458,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "winglobal",
+   "distance": 2,
+   "accuracy": 0.025390625,
+   "ce": 3.4649868458509445,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "winglobal",
+   "distance": 8,
+   "accuracy": 0.03125,
+   "ce": 3.4699418544769287,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "winglobal",
+   "distance": 24,
+   "accuracy": 0.02734375,
+   "ce": 3.4659282863140106,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "winglobal",
+   "distance": 60,
+   "accuracy": 0.03125,
+   "ce": 3.46731074154377,
+   "reachable_frac": 0.05970149253731343
+  },
+  {
+   "seed": 0,
+   "mask": "winglobal",
+   "distance": 100,
+   "accuracy": 0.04296875,
+   "ce": 3.463121920824051,
+   "reachable_frac": 0.14814814814814814
+  },
+  {
+   "seed": 0,
+   "mask": "hubs16",
+   "distance": 2,
+   "accuracy": 0.853515625,
+   "ce": 0.39283512625843287,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "hubs16",
+   "distance": 8,
+   "accuracy": 0.8671875,
+   "ce": 0.3686609868891537,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "hubs16",
+   "distance": 24,
+   "accuracy": 0.859375,
+   "ce": 0.3096201168373227,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "hubs16",
+   "distance": 60,
+   "accuracy": 0.87890625,
+   "ce": 0.29308178182691336,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "hubs16",
+   "distance": 100,
+   "accuracy": 0.826171875,
+   "ce": 0.36685002129524946,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "layered",
+   "distance": 2,
+   "accuracy": 0.28515625,
+   "ce": 2.2338458448648453,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "layered",
+   "distance": 8,
+   "accuracy": 0.03125,
+   "ce": 3.4535254687070847,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "layered",
+   "distance": 24,
+   "accuracy": 0.01953125,
+   "ce": 3.4726824313402176,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "layered",
+   "distance": 60,
+   "accuracy": 0.041015625,
+   "ce": 3.4845038056373596,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 0,
+   "mask": "layered",
+   "distance": 100,
+   "accuracy": 0.048828125,
+   "ce": 3.4694793671369553,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "full",
+   "distance": 2,
+   "accuracy": 1.0,
+   "ce": 0.00018738507424131967,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "full",
+   "distance": 8,
+   "accuracy": 1.0,
+   "ce": 0.00018613465817907127,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "full",
+   "distance": 24,
+   "accuracy": 1.0,
+   "ce": 0.00018230522073281463,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "full",
+   "distance": 60,
+   "accuracy": 1.0,
+   "ce": 0.00018596755671751453,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "full",
+   "distance": 100,
+   "accuracy": 1.0,
+   "ce": 0.00017841440785559826,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "window16",
+   "distance": 2,
+   "accuracy": 0.01953125,
+   "ce": 3.4656925052404404,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "window16",
+   "distance": 8,
+   "accuracy": 0.013671875,
+   "ce": 3.464437037706375,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "window16",
+   "distance": 24,
+   "accuracy": 0.029296875,
+   "ce": 3.465388372540474,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "window16",
+   "distance": 60,
+   "accuracy": 0.033203125,
+   "ce": 3.4666818529367447,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "window16",
+   "distance": 100,
+   "accuracy": 0.044921875,
+   "ce": 3.4673879742622375,
+   "reachable_frac": 0.0
+  },
+  {
+   "seed": 1,
+   "mask": "sw0.03",
+   "distance": 2,
+   "accuracy": 0.44921875,
+   "ce": 1.5198225304484367,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "sw0.03",
+   "distance": 8,
+   "accuracy": 0.470703125,
+   "ce": 1.3743849769234657,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "sw0.03",
+   "distance": 24,
+   "accuracy": 0.521484375,
+   "ce": 1.3122880905866623,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "sw0.03",
+   "distance": 60,
+   "accuracy": 0.41015625,
+   "ce": 1.7784103229641914,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "sw0.03",
+   "distance": 100,
+   "accuracy": 0.369140625,
+   "ce": 1.8982886597514153,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "winglobal",
+   "distance": 2,
+   "accuracy": 0.419921875,
+   "ce": 1.9450325891375542,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "winglobal",
+   "distance": 8,
+   "accuracy": 0.4375,
+   "ce": 1.811739668250084,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "winglobal",
+   "distance": 24,
+   "accuracy": 0.37890625,
+   "ce": 2.022168606519699,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "winglobal",
+   "distance": 60,
+   "accuracy": 0.044921875,
+   "ce": 3.429735466837883,
+   "reachable_frac": 0.05970149253731343
+  },
+  {
+   "seed": 1,
+   "mask": "winglobal",
+   "distance": 100,
+   "accuracy": 0.08203125,
+   "ce": 3.2780842036008835,
+   "reachable_frac": 0.14814814814814814
+  },
+  {
+   "seed": 1,
+   "mask": "hubs16",
+   "distance": 2,
+   "accuracy": 0.63671875,
+   "ce": 1.0872695595026016,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "hubs16",
+   "distance": 8,
+   "accuracy": 0.650390625,
+   "ce": 0.9353128299117088,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "hubs16",
+   "distance": 24,
+   "accuracy": 0.6328125,
+   "ce": 0.9883083589375019,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "hubs16",
+   "distance": 60,
+   "accuracy": 0.609375,
+   "ce": 1.0564721450209618,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "hubs16",
+   "distance": 100,
+   "accuracy": 0.603515625,
+   "ce": 1.026467315852642,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "layered",
+   "distance": 2,
+   "accuracy": 0.6171875,
+   "ce": 1.1189785674214363,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "layered",
+   "distance": 8,
+   "accuracy": 0.6015625,
+   "ce": 1.1576907597482204,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "layered",
+   "distance": 24,
+   "accuracy": 0.619140625,
+   "ce": 1.0932897552847862,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "layered",
+   "distance": 60,
+   "accuracy": 0.611328125,
+   "ce": 1.1166145950555801,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 1,
+   "mask": "layered",
+   "distance": 100,
+   "accuracy": 0.59375,
+   "ce": 1.1594649739563465,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "full",
+   "distance": 2,
+   "accuracy": 1.0,
+   "ce": 0.0002325042132724775,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "full",
+   "distance": 8,
+   "accuracy": 1.0,
+   "ce": 0.00023253173094417434,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "full",
+   "distance": 24,
+   "accuracy": 1.0,
+   "ce": 0.00023139274708228186,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "full",
+   "distance": 60,
+   "accuracy": 1.0,
+   "ce": 0.00023344100100075593,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "full",
+   "distance": 100,
+   "accuracy": 1.0,
+   "ce": 0.00023419833996740635,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "window16",
+   "distance": 2,
+   "accuracy": 0.373046875,
+   "ce": 2.0848724246025085,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "window16",
+   "distance": 8,
+   "accuracy": 0.361328125,
+   "ce": 2.0503205582499504,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "window16",
+   "distance": 24,
+   "accuracy": 0.32421875,
+   "ce": 2.1156585067510605,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "window16",
+   "distance": 60,
+   "accuracy": 0.029296875,
+   "ce": 3.5281862914562225,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "window16",
+   "distance": 100,
+   "accuracy": 0.025390625,
+   "ce": 3.5382738560438156,
+   "reachable_frac": 0.0
+  },
+  {
+   "seed": 2,
+   "mask": "sw0.03",
+   "distance": 2,
+   "accuracy": 0.59375,
+   "ce": 1.0666659772396088,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "sw0.03",
+   "distance": 8,
+   "accuracy": 0.6015625,
+   "ce": 1.0435172617435455,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "sw0.03",
+   "distance": 24,
+   "accuracy": 0.59375,
+   "ce": 1.053981501609087,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "sw0.03",
+   "distance": 60,
+   "accuracy": 0.517578125,
+   "ce": 1.2362022548913956,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "sw0.03",
+   "distance": 100,
+   "accuracy": 0.55078125,
+   "ce": 1.2215763665735722,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "winglobal",
+   "distance": 2,
+   "accuracy": 0.123046875,
+   "ce": 2.9675521850585938,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "winglobal",
+   "distance": 8,
+   "accuracy": 0.16015625,
+   "ce": 2.823674887418747,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "winglobal",
+   "distance": 24,
+   "accuracy": 0.130859375,
+   "ce": 2.885419100522995,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "winglobal",
+   "distance": 60,
+   "accuracy": 0.03515625,
+   "ce": 3.464356407523155,
+   "reachable_frac": 0.05970149253731343
+  },
+  {
+   "seed": 2,
+   "mask": "winglobal",
+   "distance": 100,
+   "accuracy": 0.041015625,
+   "ce": 3.4261645823717117,
+   "reachable_frac": 0.14814814814814814
+  },
+  {
+   "seed": 2,
+   "mask": "hubs16",
+   "distance": 2,
+   "accuracy": 0.03125,
+   "ce": 3.462182030081749,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "hubs16",
+   "distance": 8,
+   "accuracy": 0.0234375,
+   "ce": 3.4696033596992493,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "hubs16",
+   "distance": 24,
+   "accuracy": 0.01953125,
+   "ce": 3.472282901406288,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "hubs16",
+   "distance": 60,
+   "accuracy": 0.02734375,
+   "ce": 3.4683113992214203,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "hubs16",
+   "distance": 100,
+   "accuracy": 0.025390625,
+   "ce": 3.468301385641098,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "layered",
+   "distance": 2,
+   "accuracy": 0.255859375,
+   "ce": 2.3077436462044716,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "layered",
+   "distance": 8,
+   "accuracy": 0.22265625,
+   "ce": 2.2871420234441757,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "layered",
+   "distance": 24,
+   "accuracy": 0.208984375,
+   "ce": 2.357840657234192,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "layered",
+   "distance": 60,
+   "accuracy": 0.236328125,
+   "ce": 2.284337818622589,
+   "reachable_frac": 1.0
+  },
+  {
+   "seed": 2,
+   "mask": "layered",
+   "distance": 100,
+   "accuracy": 0.251953125,
+   "ce": 2.2764197811484337,
+   "reachable_frac": 1.0
+  }
+ ]
+}

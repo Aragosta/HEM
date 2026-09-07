@@ -235,7 +235,16 @@ last-layer-first. A homogeneous stack hides that bug completely.
 Four experiments, ordered by what they settle per CPU-hour. The first is the
 one worth doing.
 
-### 3.1 The reachability bound as an exact prediction (the good one)
+### 3.1 The reachability bound as an exact prediction — **RUN, and it holds**
+
+Result in `suite/RESULTS.md`. The cross-entropy bound held in all three seeds and
+was tight to 0.001 nats in one (3.467 against a floor of 3.466), so the
+structural analysis in §2 is now checked against trained models. R3/R4 were not
+resolvable: outcomes are bimodal (4/18 runs failed, 5/18 solved), and the only
+signal surviving the noise is that full attention is the only mask whose worst
+seed stays high — a trainability question, not a topology one.
+
+The original design follows.
 
 Adapted from arXiv:2606.02680's Theorem 2. Instead of comparing masks on a task
 and arguing about the differences, **construct a task whose answer requires one
