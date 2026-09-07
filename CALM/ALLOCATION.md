@@ -148,8 +148,8 @@ would emit.
   *measurement*; it says nothing about whether compression implies capability.
   That question is not answerable at this scale and is not asked.
 
-**Cost.** Tier 0/1 only; no training beyond models T7 produces anyway. ~2 CPU
-hours plus the coder implementation.
+**Cost.** ~2.0 h (17 short runs for the tokenizer and contamination checks;
+the correlation checks reuse T7's models) plus the coder implementation.
 
 **Gate.** If P6.1 fails, **the whole suite halts**: every downstream number is
 denominated in a unit we cannot defend. If P6.3 falsifies in the pessimistic
@@ -226,8 +226,14 @@ documented as weaker pairing than T3/T5 enjoyed). Power: T5's paired-difference
 sd of 3.38 at 6 seeds resolves a ~4% effect at t=5.65; a 1% effect needs the
 tighter pairing T7 cannot have, so **T7 is powered for ≥3% and says so up front.**
 
-**Cost.** Tier 1, ~14 CPU-hours (18 cells × 6 seeds, minus the shared dense
-corner). Tier 2 escalation only if P7.2 holds.
+**Cost.** 13 cells × 6 seeds = 78 runs, **~22 h — the largest item in the
+suite, and 15 h of it is the `N=64` arm alone.** That is an artefact of
+`MoE.forward` being a Python double loop over `(slot, expert)`: measured cost is
+0.155 s/step dense against 0.215 s at `N=4`, i.e. ~6.7 ms per mask-expert op,
+which at `N=64` means 129 of them per layer per step. **Vectorising the expert
+loop before T7 runs cuts this to ~8 h** and is also the precondition for P7.4
+being a test of the method rather than of our implementation. Tier 2 escalation
+only if P7.2 holds.
 
 **Gate.** If P7.2 fails (routing ≈ random routing), T8 and T9 are both
 *conditional-computation* experiments resting on the premise that a learned
@@ -299,7 +305,8 @@ bridge to T9 and is worth more than the perplexity column.
 **Seeds.** 5 per cell; `c` sweep at 3 seeds for the interior points, 5 at
 `c ∈ {0.25, 0.5}` where the decision lives.
 
-**Cost.** Tier 1, ~20 CPU-hours. `mor` adds a tied-weight model to `hybrid.py`.
+**Cost.** ~5.4 h (72 runs; MoD is cheaper than dense per step at `c < 1`, and
+`mor` costs ~2× for the recursion). `mor` adds a tied-weight model to `hybrid.py`.
 
 **Gate.** P8.4 gates T9. If compute allocation does not track surprisal at all,
 T9 is re-scoped from "is surprisal a better signal" to "what *is* the learned
@@ -380,8 +387,9 @@ bigram table already built in `metrics.lookup_baselines`).
 **Seeds.** 5 per arm; the two oracle arms need 3 (they have no router variance,
 only seed variance in the underlying model).
 
-**Cost.** Tier 1, ~16 CPU-hours, plus one offline oracle pass costing roughly
-2× a normal run because every token is evaluated both ways.
+**Cost.** ~3.1 h (31 runs), of which ~1 h is the offline oracle pass — every
+token evaluated both ways, but at eval cost, not training cost. **The cheapest
+experiment in the suite relative to what it can kill.**
 
 **Gate.** P9.1 decides whether idea 4 is dead. Either outcome is publishable
 internally; only "we didn't measure the confound" is not.
@@ -461,7 +469,8 @@ operating point T2 found all four architectures converging to (`participation_fr
 and the shared weights can be initialised identically, so this recovers the
 strong T3/T5-grade pairing and therefore ~1% resolution). 3 per λ point.
 
-**Cost.** Tier 1, ~18 CPU-hours. `mdl.py` is the largest new module.
+**Cost.** ~6.5 h (45 runs plus the two §4.2 cross cells). `mdl.py` is the
+largest new module, and the L0 gates cost ~15% per step.
 
 **Gate.** P10.2 is the decision. If the principled objective loses on held-out
 bits/byte, ideas 5 and 6 collapse into each other — because T11's topology claim
@@ -545,8 +554,9 @@ mask**, which is the compressibility/performance frontier stated directly.
 budget goes to the multi-hop task where the prediction lives — 6 there, 3
 elsewhere).
 
-**Cost.** Tier 1, ~24 CPU-hours — the largest in the suite. Masks are static
-buffers, so no kernel work is required at this scale; the *efficiency* claim of
+**Cost.** ~12.9 h (10 masks × 4 tasks, seeds concentrated on multi-hop where the
+prediction lives) — the second-largest item, and the one that grows fastest if
+the P11.5 length follow-up is taken. Masks are static buffers, so no kernel work is required at this scale; the *efficiency* claim of
 sparse attention is explicitly **not** tested here (dense masking of a sparse
 pattern costs the same as dense attention) and that limitation is stated in the
 module docstring, not discovered by a reader.
@@ -631,7 +641,9 @@ honest question is not "does it work" but "does it ever pay for `T` passes".
 **Seeds.** Stage A: no training. Stage B: 5 per arm, paired (the predictor is
 additive, so shared init is exact — strong pairing, ~1% resolution). Stage C: 3.
 
-**Cost.** Stage A ~2 CPU-hours. Stage B ~12. Stage C ~10 and only if B passes.
+**Cost.** Stage A ~1.5 h (no training — probes on T7's models). Stage B ~3.5 h.
+Stage C ~3.6 h, and only if B passes. **The gate structure means the expected
+cost is 1.5 h, not 8.6 h**, because Gate A is the likeliest place this stops.
 
 ---
 
@@ -708,9 +720,61 @@ Carried directly from what this repo has already measured, not from convention.
 | **2 — single GPU** | 1 GPU, hours | 120M preset, seq 1024 | only the arms that passed their tier-1 gate, and only the ones whose claim is *length-dependent* (T11 above all) |
 | **3 — comparable** | multi-GPU | published settings | not planned; listed so that the absence is deliberate |
 
-Total tier-1 budget: **~106 CPU-hours** across the seven experiments, which is
-four days of wall-clock on the current machine, or one day with the four
-independent branches of the §4.1 DAG run in parallel.
+### 4.4.1 The cost model, and where the budget actually goes
+
+Not an estimate — measured. `t1/t2/t5_results.json` record `ms_per_step` for the
+exact configuration this suite uses (dim 192, 4 layers, head_dim 32, kv_latent
+48, seq 128, batch 8, BPE-16000, 4 CPU cores):
+
+| configuration | measured | per run @ 2000 steps |
+|---|---|---|
+| dense / softmax | 0.155 s/step | 5.2 min |
+| MoE `N=4`, `k=2`+1 shared | 0.215 s/step | 7.2 min |
+| MoE `N=16` (extrapolated, same loop) | 0.375 s/step | 12.5 min |
+| MoE `N=64` (extrapolated, same loop) | 1.01 s/step | 33.8 min |
+| entmax (not used in this suite) | 0.394 s/step | — |
+
+**2000 steps is the suite standard**, chosen deliberately: T2 ran 700 steps and
+called it out itself as 0.30 epochs, under-trained, and a reason its perplexity
+column could not be read. 2000 steps is ~0.86 epoch on this corpus. Every figure
+below scales linearly in that choice.
+
+| item | runs | hours | share |
+|---|---|---|---|
+| tier-0 smoke, all arms | — | 1.0 | 1.6% |
+| lr sweep (5 lr × 3 seeds, in advance — the T2 defect) | 15 | 1.3 | 2.1% |
+| **T6** metrology | 17 | 2.0 | 3.1% |
+| **T7** conditional width | 78 | **21.9** | **35.0%** |
+| **T8** conditional depth | 72 | 5.4 | 8.6% |
+| **T9** routing signal | 31 | 3.1 | 5.0% |
+| **T10** MDL objective | 57 | 6.5 | 10.4% |
+| **T11** topology | 150 | **12.9** | **20.6%** |
+| **T12** residual coding (A+B+C) | 44 | 8.6 | 13.7% |
+| **total** | **464** | **62.7** | |
+
+Total tier-1 budget: **~63 CPU-hours nominal, ~81 h with a 30% contingency for
+re-runs and non-finite rows.** Three things move that number materially:
+
+* **Vectorise `MoE.forward` first.** The Python `(slot, expert)` loop is 35% of
+  the suite's entire budget and all of T7's `N=64` cell. A batched
+  `index_add`/einsum implementation takes the suite to **~48 h nominal, ~63 h
+  with contingency** — a saving larger than any other decision available here,
+  and it is a day of work.
+* **Steps.** At the old 700-step setting the suite is ~22 h, but T2 already
+  established that 700 steps cannot resolve a perplexity comparison at this
+  scale. Buying the shorter run buys an unreadable result; this is the one place
+  the budget should not be cut.
+* **Gates.** The §4.1 DAG is designed so failures are cheap. If Gate A of T12
+  fails, 7 h evaporates; if T6's round-trip fails, the whole 63 h stops on day
+  one. **Expected** cost is meaningfully below nominal, and that is deliberate.
+
+**"CPU-hours" here means wall-clock hours of one run at a time**, since torch is
+already threading across the 4 cores — the measured `ms_per_step` figures include
+that. Running the DAG's four independent branches concurrently requires
+`OMP_NUM_THREADS=1` per process, which raises per-run time roughly 2–3× and so
+yields a net throughput gain of only ~1.5×, not 4×. Realistically: **~8 days of
+wall-clock serial, ~5 days with the branches parallelised, ~4 days if the MoE
+loop is vectorised first.**
 
 ### 4.5 The traps this suite is explicitly built to avoid
 
@@ -775,22 +839,25 @@ If a null arrives, the next experiment is already decided:
 | 1 | `suite/budget.py` + tests | — | 0.5 d |
 | 2 | `suite/coding.py` (arithmetic coder + round-trip test) | — | 1 d |
 | 3 | `suite/preregister.py` | — | 0.25 d |
-| 4 | **T6** — metrology gate | 2, 3 | 0.5 d + 2 h compute |
+| 4 | **T6** — metrology gate | 2, 3 | 0.5 d + 2.0 h |
 | 5 | `suite/routing.py` (router ABC, capacity contract, causality assert) | 1 | 1 d |
-| 6 | **T7** — conditional width | 1, 3, 4 | 0.5 d + 14 h |
+| 6 | **T7** — conditional width | 1, 3, 4 | 0.5 d + 21.9 h |
 | 7 | MoD/MoR blocks in `hybrid.py` | 5 | 1 d |
-| 8 | **T8** — conditional depth | 6, 7 | 0.5 d + 20 h |
-| 9 | **T9** — routing signal (incl. offline oracles) | 8 | 1 d + 16 h |
+| 8 | **T8** — conditional depth | 6, 7 | 0.5 d + 5.4 h |
+| 9 | **T9** — routing signal (incl. offline oracles) | 8 | 1 d + 3.1 h |
 | 10 | `suite/mdl.py` (two-part accountant, hard-concrete gates) | 2 | 1.5 d |
-| 11 | **T10** — MDL objective | 10 | 0.5 d + 18 h |
+| 11 | **T10** — MDL objective | 10 | 0.5 d + 6.5 h |
 | 12 | `suite/graphs.py` (masks + graph metrics) | — | 1 d |
 | 13 | Synthetic retrieval tasks (needle, multi-hop) | — | 0.5 d |
-| 14 | **T11** — topology | 11, 12, 13 | 0.5 d + 24 h |
-| 15 | **T12-A** — redundancy probe | 6 | 0.25 d + 2 h |
-| 16 | **T12-B** — one-pass residual coding | 15 | 1 d + 12 h |
-| 17 | **T12-C** — full predictive coding | 16 | 1 d + 10 h |
+| 14 | **T11** — topology | 11, 12, 13 | 0.5 d + 12.9 h |
+| 15 | **T12-A** — redundancy probe | 6 | 0.25 d + 1.5 h |
+| 16 | **T12-B** — one-pass residual coding | 15 | 1 d + 3.5 h |
+| 17 | **T12-C** — full predictive coding | 16 | 1 d + 3.6 h |
 
-≈ 13 engineering days, ≈ 106 CPU-hours, with four independently runnable branches.
+≈ 13 engineering days, **≈ 63 CPU-hours nominal / ~81 h with contingency**
+(§4.4.1), with four independently runnable branches. Item 1a — vectorise
+`MoE.forward` — is not in the list above and should be: one day of work that
+removes ~15 h of compute and makes P7.4 answerable.
 
 ---
 
