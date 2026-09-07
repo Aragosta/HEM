@@ -630,3 +630,205 @@ Two bugs caught before they reached a result:
 One claim retracted mid-run: after row 13 the data looked like perplexity rising
 monotonically with sparsity. Row 14 killed it — 77% zeros for +0.25 perplexity,
 against 83% zeros for +19.39. It had been explicitly hedged to one seed.
+
+---
+
+# Two-hour run — what the seven ideas look like when tested
+
+`ALLOCATION.md` designs a ~63 CPU-hour suite. This is what was actually run in
+two hours, and it is a different kind of thing: gates, structural audits and
+metrology, chosen because they answer something decisive at a cost the window
+allows. **No perplexity comparison here resolves** — at 1000 steps (0.43 epoch)
+against T2's measured seed sd of 1.5–5.0, none can. Every number below is either
+a ratio, a correlation, an exact identity, or a property of a graph.
+
+| idea | what was run | verdict |
+|---|---|---|
+| 3 — bits/byte as metric | full T6 round trip | **licensed** — it is the compressed size, to 0.01% |
+| 6 — compressibility topology | T11's graph half, no training | **interior optimum confirmed**, and the standard design is off the frontier |
+| 2 — conditional depth | T8's causality audit, no training | **the leak is real**: 5.8% of selections at `c=0.5` |
+| 7 — residual-only propagation | T12 Gate A | **premise holds but is not learned** — R² 0.93 trained vs 0.93 at init |
+| 4 — surprisal routing | T9's oracle bracket | **the confound is large**: ρ = +0.11, overlap 0.56 against a chance floor of 0.50 |
+| 1 — conditional width | T7's random-router control | see G2 below |
+| 5 — MDL objective | nothing | needs `mdl.py` and training runs; not attempted, and not to be read as tested |
+
+---
+
+## Idea 3 — bits-per-byte is the compressed size (`coding.py`)
+
+Witten–Neal–Cleary arithmetic coder, order-1 byte model fitted on wikitext2
+train, 32 KB of held-out valid coded.
+
+| model | analytic bits/byte | emitted bits/byte | gap | round trip |
+|---|---|---|---|---|
+| order-0 | 4.7700 | 4.7703 | 0.01% | byte-exact |
+| order-1 | 3.4651 | 3.4651 | 0.00% | byte-exact |
+
+All three checks pass: the round trip is exact, the emitted rate equals the
+analytic cross-entropy, and the order-1 saving is the same measured either way
+(1.3050 analytic, 1.3052 emitted). **The unit the rest of the suite is
+denominated in is real.** The model is deliberately trivial — the claim under
+test is about the coder and the arithmetic, and a trained network would confound
+a coder bug with a model bug.
+
+What this does *not* establish: that compression predicts capability. T6 licenses
+a measurement, nothing more.
+
+## Idea 6 — the compressibility/mixing frontier (`graphs.py`)
+
+Every mask carries **exactly 2040 edges** (24.7% of the causal upper triangle),
+so density cannot explain any difference. `reach@4` is the fraction of
+(query, earlier key) pairs joined by a path of ≤4 hops — the dependencies a
+4-layer model can structurally represent.
+
+| mask | zlib bytes | reach@4 | spectral gap | clustering | degree CV |
+|---|---|---|---|---|---|
+| p=0 (pure window) | 87 | 0.7558 | 0.031 | 0.764 | 0.205 |
+| **p=0.01** | **234** | **0.9965** | 0.042 | 0.738 | 0.205 |
+| **p=0.03** | **382** | **0.9994** | 0.057 | 0.705 | 0.205 |
+| p=0.1 | 649 | 0.9979 | 0.103 | 0.610 | 0.205 |
+| p=0.3 | 919 | 0.9918 | 0.238 | 0.422 | 0.205 |
+| p=1 (random) | 1075 | 0.7645 | 0.657 | 0.314 | 0.205 |
+| window+global | 355 | 0.6548 | 0.164 | 0.799 | 0.205 |
+| bigbird | 894 | 0.9979 | 0.329 | 0.489 | 0.269 |
+| modular | 387 | 0.9621 | 0.009 | 0.911 | 0.584 |
+
+**Q1 holds**: compressed size rises monotonically with `p`, 87 → 1075 bytes.
+Randomness is incompressible, as it must be.
+
+**Q2 holds, and more sharply than predicted.** Reachability is *non-monotone*:
+0.756 at `p=0`, 0.999 at `p=0.03`, back to 0.765 at `p=1`. The interior optimum
+the small-world literature predicts is present, and it is cheap — `p=0.01` buys
+99.7% reachability for 234 bytes, a quarter of the random graph's description
+length. The mechanism is visible in the two ends: a pure lattice has no
+shortcuts, and a purely random causal graph has destroyed the local chain that
+carried information between *nearby* tokens, so both fail at 4 hops for opposite
+reasons.
+
+**Q3 holds**: `bigbird` (reach 0.998 at 894 B) sits on the sweep curve near
+`p=0.3`. Its random edges are the shortcuts; it is the same object under another
+name.
+
+**Q4 fails, and this is the finding.** `window+global` has the *worst*
+reachability of anything tested — 0.655, below even the pure window. At a fixed
+edge budget its hub tokens are paid for out of the local window, and a hub
+shortens paths to the *first few positions*, not between mid-sequence pairs. The
+standard sparse-attention design is not near this frontier; on this metric it is
+strictly dominated by rewiring 1% of a plain window.
+
+Caveat that limits all of it: this is graph structure. Which point a task wants
+is not tested, and the reachability metric assumes every edge carries
+information equally, which attention does not.
+
+## Idea 2 — the MoD causality leak is real (`mod_audit.py`)
+
+Top-k over the sequence is a comparison *between* tokens, so a token's selection
+can depend on tokens after it. Comparing the full-sequence selection against the
+prefix-only selection a generation-time router could compute:
+
+| capacity | disagreement | per layer |
+|---|---|---|
+| 0.125 | 4.44% | 4.3 / 4.1 / 4.2 / 5.2% |
+| 0.25 | 5.57% | 4.3 / 5.1 / 6.1 / 6.8% |
+| 0.50 | 5.83% | 4.9 / 5.5 / 6.5 / 6.4% |
+| 0.75 | 5.19% | 5.4 / 4.8 / 4.9 / 5.7% |
+
+**The registered prediction was wrong.** I expected disagreement to fall as
+capacity rises, because at `c → 1` almost everything is selected under either
+rule. It is roughly flat, peaking at `c=0.5` — which in hindsight is the obvious
+shape: `c=0.5` is where the selection boundary passes through the densest part of
+the score distribution, so it is maximally sensitive to which scores are in view.
+
+At ~6% of positions changing, any MoD result reported without the
+causal-predictor evaluation is inflated. That is not a large leak, but it is
+larger than the effect sizes this suite is powered to detect, so for T8 it is
+load-bearing rather than cosmetic.
+
+## Idea 7 — layers are redundant, but not because they learned to be (`triage.py`, G1)
+
+R² of a least-squares map from each block's residual stream to the next.
+
+| seed | perplexity | mean R² | R² at init | middle-layers R² | per pair |
+|---|---|---|---|---|---|
+| 0 | 164.90 | 0.9316 | 0.9297 | 0.9801 | 0.782 / 0.986 / 0.974 / 0.984 |
+| 1 | 170.17 | 0.9332 | 0.9289 | 0.9752 | 0.792 / 0.961 / 0.989 / 0.990 |
+
+**Gate A passes on the level and fails on the interpretation.** Mean R² is 0.93,
+far above the 0.5 kill threshold, and the middle layers are 0.98 — only ~2% of
+the variance entering a middle block is new. So there is a large predictable
+component to subtract, and T12 stage B is buildable.
+
+But the initialisation column is the result. R² at init is **0.9297**, and after
+1000 steps it is **0.9316** — training moved it by 0.2%. The redundancy is a
+property of the residual architecture, not something the model learned: a
+residual block is near-identity at init and stays close to it. That reframes
+idea 7. Predictive coding's premise was that *learned* representations are
+mutually predictable and the code wastes bits on it; here the predictability is
+the skip connection, which already costs nothing to transmit. Removing it saves
+description length that was not being paid.
+
+The honest next step is therefore not stage B as designed. It is to ask whether
+the ~2% that *is* new per middle layer is where all the work happens, which is a
+different and cheaper question.
+
+## Idea 4 — the epistemic/aleatoric confound is large (`triage.py`, G3)
+
+Per held-out token: total surprisal under the full model, against *reducible*
+surprisal (truncated-depth loss minus full-depth loss — what the last block
+actually bought that token).
+
+| seed | ρ(total, reducible) | top-half overlap | reducible share of surprisal |
+|---|---|---|---|
+| 0 | +0.0650 | 0.5440 | 1.44% |
+| 1 | +0.1472 | 0.5782 | 0.95% |
+
+Chance overlap is 0.50. **A router selecting the top half of tokens by total
+surprisal picks essentially the same set as flipping a coin against the tokens
+extra depth actually helps** — 0.56 against a 0.50 floor, at ρ ≈ +0.11.
+
+This is the objection quantified, and it is worse than the framing suggested. The
+two signals are not merely imperfectly aligned; they are close to unrelated. A
+non-parametric router on entropy or surprisal would spend its budget on tokens
+that are unpredictable *and stay unpredictable*.
+
+The second column is the one that limits the whole idea though: **only ~1.2% of
+total surprisal is removable by the last block at all.** At this scale nearly all
+surprisal is aleatoric, so the ceiling on *any* depth-routing policy — oracle
+included — is about 1% of the loss. That is a statement about a 4-layer model on
+0.43 epochs, not about language models, and it is exactly the kind of claim that
+should invert at scale. But within this suite it says T9's ordering of arms
+matters less than whether there is anything to allocate.
+
+## Idea 1 — the random-router control (`triage.py`, G2) — RUNNING
+
+12 paired runs (6 seeds × {learned router, router frozen at random
+initialisation}), MoE `N=4`, `k=2` + 1 shared, at ~5 min each. Still in flight at
+the two-hour mark; results append here when it lands. The number to read is
+**token/expert mutual information**, not perplexity: T2 established that
+perplexity at this budget is noise and that order parameters reproduce to three
+significant figures on the same runs.
+
+## Idea 5 — MDL as the objective — NOT ATTEMPTED
+
+Needs `mdl.py` (two-part accountant, hard-concrete L0 gates) and its own training
+runs. Nothing about it was measured, and nothing above bears on it.
+
+---
+
+## What the two hours cost, and what it bought
+
+Compute was not the constraint — the four completed pieces used ~10 CPU-minutes
+between them, plus ~25 minutes for the two dense training runs. **Implementation
+was the constraint**, which is the argument for the shared-infrastructure section
+of `ALLOCATION.md` §2: `coding.py` and `graphs.py` were written here as
+one-offs and are now the modules T6 and T11 need.
+
+Three of the seven ideas turned out to be answerable — decisively — with no
+training at all, because their load-bearing claims are about a coder, a graph, or
+a selection rule rather than about a model. That is worth carrying back into the
+full design: **T6 and the graph half of T11 should move to the front of the DAG
+and stop being budgeted as GPU work.**
+
+Two registered predictions failed (T8's capacity trend, T11's Q4). Both failures
+were more informative than the corresponding passes, and neither would have been
+visible from the design document.
