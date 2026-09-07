@@ -885,3 +885,45 @@ rather than any individual arm:
   organising distinction is not measurable at this scale. That is a failure of
   the *design*, and it would be the most important thing this suite could learn
   about itself.
+
+---
+
+## 8. The two-hour cut
+
+Asked for in two hours rather than 63. That is a 30× cut, and it changes what
+kind of question can be asked, not just how many.
+
+**What does not survive the cut, and why.** At two hours nothing in the
+perplexity column resolves. T2 measured a seed sd of 1.5–5.0 perplexity here;
+T3 showed even a *paired* design needs ~6 seeds to see 1%. A cut-down version
+of T7's headline comparison, or of T11's `p` sweep, would produce a number with
+no gate behind it — which is the exact failure this suite was written to stop.
+So the comparisons are dropped whole rather than run small.
+
+**What survives are the gates and the measurements** — the checks that can kill
+an idea outright, and the internal-state instrumentation that T2 found roughly an
+order of magnitude more sensitive than the loss at equal compute. Three fit, and
+they are implemented in `suite/triage.py`:
+
+| gate | from | what it decides | cost |
+|---|---|---|---|
+| **G1** adjacent-layer R², trained vs at initialisation | T12 Gate A | mean R² < 0.5 ⇒ there is no redundancy for residual-only propagation to remove, and **idea 7 dies today** | 2 runs |
+| **G2** learned router vs router **frozen at init**, paired | T7 P7.2 | the control T2 lacked. Token/expert MI ≈ 0 for both ⇒ routing carries no more information than a random projection, and T8/T9 need re-scoping before they cost anything | 12 runs |
+| **G3** total vs **reducible** surprisal, eval-only | T9 P9.1 | ρ and top-half overlap between the tokens a surprisal router would pick and the tokens extra depth actually helps — the epistemic/aleatoric confound, measured | 0 runs |
+
+G1 carries an initialisation baseline because an untrained block is close to the
+identity, so R² ≈ 1 before training and the gate would otherwise pass trivially.
+The quantity of interest is redundancy the model *learned*, and the direction of
+travel between the two numbers is more informative than either.
+
+**What is explicitly not tested, so it is not later mistaken for having been:**
+the arithmetic-coding round trip (T6 needs a coder), conditional depth (T8 needs
+a new block), and the topology sweep (T11 needs mask generators and synthetic
+tasks). Each is missing a piece of infrastructure that cannot be written in the
+window, and a version without that piece would not be the experiment.
+
+**Standing caveat on everything the two-hour run produces:** 1000 steps is ~0.43
+epoch and 6 seeds is under-powered against the measured noise floor. The
+perplexity column in `triage_results.json` is a diagnostic. The gates are not —
+they are ratios and correlations of internal quantities, which is precisely why
+these three were the ones chosen to survive.
