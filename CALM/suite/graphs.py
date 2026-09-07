@@ -167,6 +167,58 @@ def modular(n: int, block: int, target: int, seed: int) -> Graph:
     return _trim_or_grow(graph, target, rng)
 
 
+def influence(layers: List[Graph], n: int) -> Dict[str, float]:
+    """Linearised influence of input k on output q after the whole stack.
+
+    Reachability is binary and says only whether a path exists. What a designer
+    needs is how much signal survives the trip, and attention admits an exact
+    linearisation: at initialisation softmax over a token's allowed keys is
+    uniform, so one layer is multiplication by the row-stochastic M = D^-1 A and
+    the stack is Phi = M_L ... M_2 M_1 -- **last layer leftmost**, because it
+    acts last. Entry Phi[q, k] is the share of output q attributable to input k.
+
+    This is the Information Payload of Zhang et al. (arXiv:2205.14014) taken
+    over all paths rather than only shortest ones, and it is what separates "a
+    path exists" from "the path carries anything". Their analysis of the star
+    graph -- best in class by diameter, crippled by the bottleneck at the hub --
+    is the failure mode this function exists to detect.
+
+    Unreachable pairs contribute a genuine zero and are counted. Filtering them
+    out would report the median over the pairs that happen to work, which is the
+    opposite of a bottleneck measurement.
+    """
+    import torch
+
+    def stochastic(graph: Graph) -> "torch.Tensor":
+        matrix = torch.zeros(n, n, dtype=torch.float64)
+        for q in range(n):
+            for k in graph[q]:
+                matrix[q, k] = 1.0
+        return matrix / matrix.sum(1, keepdim=True).clamp_min(1e-12)
+
+    phi = stochastic(layers[-1])
+    for layer in reversed(layers[:-1]):
+        phi = phi @ stochastic(layer)
+
+    bands = ((1, 4), (5, 16), (17, 48), (49, 127))
+    out: Dict[str, float] = {}
+    for low, high in bands:
+        values = sorted(phi[q, q - d].item()
+                        for q in range(n) for d in range(low, min(high, q) + 1))
+        out[f"influence_{low}_{high}"] = values[len(values) // 2] if values else 0.0
+        if (low, high) == (49, 127):
+            out["influence_far_p10"] = values[len(values) // 10] if values else 0.0
+            out["influence_far_zero_frac"] = (
+                sum(1 for v in values if v <= 0.0) / max(len(values), 1))
+    # Concentration: how much of each output is explained by the few landmark
+    # columns. A design that routes everything through hubs shows up here.
+    column_mass = phi.sum(0)
+    share = column_mass / column_mass.sum()
+    top = share.sort(descending=True).values
+    out["top16_column_share"] = top[:16].sum().item()
+    return out
+
+
 def full_mask(n: int) -> Graph:
     return [set(range(q + 1)) for q in range(n)]
 
