@@ -190,6 +190,12 @@ class Attention(nn.Module):
                 torch.full((heads, 1, 1), -math.log(max(ref_len, 2))))
         self.collect_stats = False
         self.stats: dict = {}
+        # An explicit (n, n) boolean mask, True where a query may read a key.
+        # None means ordinary causal attention. Set per layer by
+        # HybridDecoder.set_masks so a stack can be layer-heterogeneous, which
+        # is what every production sparse design is and what a homogeneous mask
+        # family cannot express.
+        self.attn_mask: Optional[torch.Tensor] = None
 
         # Rotary, applied in the *Euclidean* head coordinates before the lift.
         # Rotation is an isometry of the space part and leaves |q| unchanged, so
@@ -256,6 +262,9 @@ class Attention(nn.Module):
             out = self._attend_entmax(q, k, v, n)
         elif self.collect_stats:
             out = self._attend_with_stats(q, k, v, n)
+        elif self.attn_mask is not None:
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=self.attn_mask[:n, :n], scale=1.0)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0)
         return self.wo(out.transpose(1, 2).reshape(b, n, -1))
@@ -525,6 +534,29 @@ class HybridDecoder(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+
+    def set_masks(self, masks) -> None:
+        """Install one boolean (n, n) mask per layer; None restores causal.
+
+        `masks[i][q, k]` True means layer `i`'s query at `q` may read key `k`.
+        Every mask must be causal -- a mask allowing `k > q` would leak the
+        future, and this checks rather than trusting the caller.
+        """
+        if masks is None:
+            for block in self.blocks:
+                block.attn.attn_mask = None
+            return
+        if len(masks) != len(self.blocks):
+            raise ValueError(f"need one mask per layer: {len(masks)} vs "
+                             f"{len(self.blocks)}")
+        for block, mask in zip(self.blocks, masks):
+            if mask.dtype != torch.bool:
+                raise TypeError("masks must be boolean")
+            if bool(mask.triu(1).any()):
+                raise ValueError("mask allows a query to read a later key")
+            if not bool(mask.diagonal().all()):
+                raise ValueError("mask must keep every self-edge")
+            block.attn.attn_mask = mask
 
     def set_stats(self, on: bool) -> None:
         """Turn the order-parameter instrumentation on or off everywhere."""
