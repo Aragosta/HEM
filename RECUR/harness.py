@@ -28,7 +28,7 @@ import math
 import statistics
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -230,6 +230,46 @@ def evaluate_kl_exit(model, eval_set, spec, loops: int,
 
 @torch.no_grad()
 @torch.no_grad()
+def beta_transfer(model, eval_set, spec, scales=(0.25, 0.5, 1.0, 2.0, 4.0),
+                  loops: Optional[int] = None) -> Dict:
+    """Train at one temperature, evaluate at several. Costs no training.
+
+    Two literatures point opposite ways and both are about beta. Velickovic et
+    al. (arXiv:2410.01104) show softmax *disperses* out of distribution and
+    propose raising sharpness **at inference**; our A1 sweep says a **lower**
+    beta is better **during training**. Those are compatible if the right
+    schedule is soft-to-learn, sharp-to-decide -- and that is checkable for
+    free, because the temperature is a multiplier on the logits and needs no
+    retraining to change.
+
+    Reports accuracy at each evaluation temperature for a model trained at one,
+    so the diagonal is the usual "train and test at the same beta" number and
+    the off-diagonal is the transfer.
+    """
+    from model import Attention
+    heads = [m for m in model.modules() if isinstance(m, Attention)]
+    original = [h.cfg.beta_scale for h in heads]
+    positions = spec.answer_positions()
+    out = {}
+    model.eval()
+    try:
+        for scale in scales:
+            for h in heads:
+                h.cfg = replace(h.cfg, beta_scale=scale)
+            accs = []
+            for hop, (tokens, target, _) in eval_set.items():
+                logits, _ = model(tokens, loops=loops)
+                pred = answer_logits(logits, positions)
+                accs.append((pred.argmax(-1) == target).float().mean().item())
+            out[f"eval_beta_x{scale:g}"] = sum(accs) / len(accs)
+    finally:
+        for h, beta in zip(heads, original):
+            h.cfg = replace(h.cfg, beta_scale=beta)
+        model.train()
+    return out
+
+
+@torch.no_grad()
 def attention_entropy(model, tokens, loops: Optional[int] = None):
     """Per-loop attention entropy, the order parameter of the phase diagram.
 
@@ -378,6 +418,7 @@ def train_hops(cfg: Config, spec: HopSpec, steps: int, batch_size: int = 64,
         "trajectories": expert_trajectories(model, eval_set, spec),
         "attention_entropy": attention_entropy(
             model, eval_set[spec.hops[0]][0][:64]),
+        "beta_transfer": beta_transfer(model, eval_set, spec),
         "expert_graph": expert_graph(model, eval_set, spec),
         "routing_state": routing_state(model),
         "expert_load": [l.tolist() for l in model.expert_load()],
