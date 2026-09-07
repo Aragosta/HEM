@@ -3,8 +3,11 @@
 
 A1 found the largest effect in this project and pointed the opposite way to my
 prediction. Accuracy at R=4 runs 0.678 / 0.639 / 0.608 / 0.607 / 0.456 as the
-temperature multiplier goes 0.25 / 0.5 / 1 / 2 / 4, so **colder is better** and
-the default 1/sqrt(head_dim) is already on the sharp side of the optimum. At
+temperature multiplier goes 0.25 / 0.5 / 1 / 2 / 4, so **a lower beta is
+better** -- softer, hotter attention -- and the default 1/sqrt(head_dim) is
+already on the sharp (cold) side of the optimum. The arm below is named `cold`
+for the multiplier being small; beta is the *inverse* temperature, so it is in
+fact the hot arm. The name is kept because the result files carry it. At
 x0.25 the plain model scores 0.678 -- which is within noise of the 0.671 that
 E3's per-loop router bias earned at the default temperature.
 

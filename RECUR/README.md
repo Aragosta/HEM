@@ -107,7 +107,8 @@ The short version, in the order the rounds found it:
    scratchpad running out (which E2 looked for and did not find).
 3. **The contraction is governed by attention temperature**, and that one scalar
    moves accuracy by 0.26 -- four times any architectural change tested here.
-   The optimum is *colder* than the default and gets colder as depth grows.
+   The optimum is a *lower* beta than the default -- softer attention -- and it
+   drops further as depth grows.
    Tuning it **subsumes** the only architectural win the earlier rounds produced
    (loop-conditioned MoE routing: +0.062 at the default temperature, -0.018 once
    the temperature is right).

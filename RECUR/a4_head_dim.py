@@ -12,7 +12,9 @@ muP's stated reason is the same mechanism A1's failed prediction ran into. The
 at initialisation and false afterwards: training makes them correlated, the
 logits grow like `d` rather than `sqrt(d)`, and the standard scaling
 under-corrects. That is why our trained entropy sits at 0.41-0.53 while the
-untrained model measures 0.82-0.89, and why the useful correction is *colder*.
+untrained model measures 0.82-0.89, and why the useful correction is a *lower*
+beta -- softer attention. (beta is the inverse temperature: low beta is hot and
+uniform, high beta is cold and frozen.)
 
 If that reading is right, the coincidence is not a coincidence and it must
 reproduce at other head dimensions. The test is a sweep of head_dim against the

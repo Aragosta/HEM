@@ -15,6 +15,14 @@ phase (hard argmax, copies one token) and a useful regime in between.
 
 Nothing in the first 146 runs had measured where our model sits on that axis.
 
+> **A note on the word "temperature".** β is the *inverse* temperature:
+> `p ∝ exp(−βE)`. High β means **low** temperature — sharp, frozen attention.
+> Low β means **high** temperature — soft, uniform attention. Earlier drafts of
+> this file used "colder" for lower β, which is backwards. Every number below is
+> unchanged; the optimum is at **lower β**, i.e. **softer, hotter** attention
+> than the `1/√d` default, and the frozen phase is the *cold* one.
+
+
 ---
 
 ## The verdict, against the predictions registered before the runs
@@ -23,16 +31,17 @@ Nothing in the first 146 runs had measured where our model sits on that axis.
 | --- | --- | --- |
 | A1a | accuracy has an interior optimum in β | **held, emphatically** — a 16× sweep moves accuracy from 0.709 to 0.447 against a seed spread of 0.004–0.046. This is the largest effect measured anywhere in this project |
 | A1b | attention entropy falls across loops | **held, with the same shape as everything else** — sharp drop from loop 1 to loop 2, then flat (0.711 → 0.669 → 0.678 → 0.672) |
-| A1c | the optimum is *hotter* than the default | **failed, in the opposite direction** — the optimum is **colder** (×0.5 at R=1, ×0.25 at R=4). I predicted from the entropy of an *untrained* model; training sharpens attention hard, so the default already sits on the sharp side |
+| A1c | the optimum is *hotter* than the default | **failed, in the opposite direction** — the optimum is at **lower β — softer attention** (×0.5 at R=1, ×0.25 at R=4). I predicted from the entropy of an *untrained* model; training sharpens attention on its own, so the default already sits on the sharp (cold) side and the useful correction is to soften |
 | A2a | a learned per-loop β beats a fixed one | **failed** — −0.030 against doing nothing |
 | A2b | temperature and routing gains do not add | **held, and then some** — they *interfere*: +0.062 (routing) and −0.030 (temperature) combine to +0.021, below either the sum or the larger single |
 | A3a | the router bias adds nothing at the right temperature | **held** — −0.018. At ×0.25 the plain model scores 0.678; adding E3's per-loop bias gives 0.660 |
 | A3b | the two are different mechanisms and both belong | **failed** — see A3a |
 
-**The unpredicted finding, and the one worth carrying forward: the optimal
-temperature moves with loop count.** Best is ×0.5 at R=1 and ×0.25 at R=4. A
-weight-shared head run repeatedly over a contracting state needs to *start
-colder* to stay in the useful regime — which is the "the loop walks along the β
+**The unpredicted finding, and the one worth carrying forward: the optimal β
+moves with loop count.** Best is ×0.5 at R=1 and ×0.25 at R=4 — *softer* as
+depth grows. A weight-shared head run repeatedly over a contracting state
+sharpens itself with every pass, so it has to *start softer* to stay in the
+useful regime — which is the "the loop walks along the β
 axis" story showing up as a measurement rather than an argument.
 
 **And the demotion.** Loop-index-conditioned MoE routing was round one's only
@@ -130,7 +139,7 @@ Reading the three rounds together:
 2. **The mechanism (T2b)**: the loop is a contraction; routing convergence is
    the shadow of state convergence, r = −0.877.
 3. **The knob (A1–A3)**: the contraction is governed by attention temperature,
-   the optimum moves colder as depth grows, and getting it right subsumes the
+   the optimum moves to softer attention as depth grows, and getting it right subsumes the
    only architectural win the earlier rounds produced.
 
 That is a coherent story, and it points somewhere unglamorous: before adding

@@ -5,10 +5,10 @@ A head computes ``softmax(beta * q.k)``. That is a Boltzmann distribution over
 keys with energy ``-q.k`` at inverse temperature ``beta``, and in a standard
 transformer ``beta = 1/sqrt(head_dim)`` -- a variance-normalising constant that
 nobody chose as a temperature. The theory collected in `../CALM/CRITICALITY.md`
-§1 says this parameter has a phase diagram: too cold and attention is uniform
-and the head outputs an average (disorder, rank collapse); too hot and it
-becomes a hard argmax that copies one token (frozen); the useful regime is in
-between, and the critical scale grows like ``log n``.
+§1 says this parameter has a phase diagram: **beta too low** (hot) and attention
+is uniform and the head outputs an average (disorder, rank collapse); **beta too
+high** (cold) and it becomes a hard argmax that copies one token (frozen); the
+useful regime is in between, and the critical scale grows like ``log n``.
 
 Nothing in this repo has measured where our model sits. This sweeps
 ``beta_scale`` -- a plain multiplier on ``1/sqrt(head_dim)`` -- at two depths,
@@ -27,10 +27,17 @@ Registered predictions:
   is flat over a 16x range of temperature, this model is nowhere near either
   phase boundary and the whole criticality framing is inapplicable at n=37.
 - **A1b.** Entropy falls monotonically across loops at R=4.
-- **A1c.** The optimum sits at ``beta_scale > 1``. Basis: entropy measured at
-  initialisation is 0.82-0.89 of maximum, which is the disordered side, so the
-  useful direction is hotter. This is the prediction most likely to be wrong
-  and the cheapest to check.
+- **A1c.** The optimum sits at ``beta_scale > 1`` -- a *higher* beta, i.e.
+  sharper and colder attention. Basis: entropy measured at initialisation is
+  0.82-0.89 of maximum, which is the disordered (hot) side, so the useful
+  direction looks like sharpening. This is the prediction most likely to be
+  wrong and the cheapest to check.
+
+  (Note on wording: beta is the *inverse* temperature, so high beta is cold and
+  sharp, low beta is hot and uniform. Earlier drafts of this suite used
+  "colder" for lower beta, which is backwards; the arm named ``cold`` in
+  ``a3_cold_plus_router.py`` is in fact the *hot*, soft-attention arm. The name
+  is kept because result files carry it.)
 
 Usage::
 

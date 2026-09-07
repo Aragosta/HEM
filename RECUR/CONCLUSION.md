@@ -32,10 +32,11 @@ itself.
 **The contraction is governed by attention temperature, and that scalar
 dominates everything else here.** A 16× sweep of β moves accuracy from 0.709 to
 0.447 against a seed spread of 0.004–0.046 — roughly four times the effect of
-any architectural change tested. The optimum is *colder* than the default
-1/√head_dim, and gets colder as depth grows (×0.5 at R=1, ×0.25 at R=4): a
-weight-shared head run repeatedly over a contracting state must start colder to
-stay in the useful regime.
+any architectural change tested. The optimum is a **lower β than the default 1/√head_dim — softer attention** —
+and it drops further as depth grows (×0.5 at R=1, ×0.25 at R=4): a weight-shared
+head sharpens itself on every pass, so it has to start softer to stay in the
+useful regime. (β is *inverse* temperature: low β is the hot, uniform phase;
+high β is the cold, frozen one.)
 
 ---
 
@@ -89,7 +90,7 @@ object:
 prelude → [shared core] × ~2 → coda        depth 2, not 8
 standard residuals                          AttnRes earns nothing under ~30 layers
 MoE, balanced                               experts hold facts; they do not specialise here
-per-loop attention temperature, cold        the one knob that dominated
+per-loop attention temperature, low beta     the one knob that dominated
 zero-shot KL exit                            free, and matched every trained gate
 no registers, no cross-loop memory          no effect found (underpowered)
 no step-conditioned routing                 subsumed by the temperature
