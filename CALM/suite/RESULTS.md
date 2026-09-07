@@ -748,6 +748,54 @@ means the frontier as drawn is pessimistic exactly where a designer would want t
 look. A description length that counted the generating program, not the bitmap,
 would move these points sharply left.
 
+### Letting layers differ beats every homogeneous mask by 3x
+
+Every mask above is homogeneous — the same graph at every layer — and that is
+the one thing production designs do not do. Gemma-style local/global
+interleaving, and Kimi K3's 3:1 stack of Kimi Delta Attention layers to Gated
+MLA layers, both vary the mask by depth. That is a strictly larger design space:
+`depth` hops through `depth` different graphs.
+
+Measured at n=128, depth 4, counting total edges across all four layers:
+
+| design | edges | vs baseline | reach@4 |
+|---|---|---|---|
+| homogeneous window w=16 | 8160 | 1.00× | 0.756 |
+| homogeneous small-world p=0.03 | 8160 | 1.00× | 1.000 |
+| homogeneous hubs/16 | 7800 | 0.96× | 1.000 |
+| homogeneous window w=32 | 14784 | 1.81× | 1.000 |
+| 3× window w=16 + 1 **full** | 14376 | 1.76× | 1.000 |
+| 3× window w=4 + 1 **full** | 10146 | 1.24× | 1.000 |
+| **3× window w=3 + 1 hubs/8** | **2718** | **0.33×** | **1.000** |
+
+A sweep over local width × hub stride puts the cheapest full-coverage design at
+**2718 edges — 0.33× the baseline, and 5.4× cheaper than the cheapest
+homogeneous window that achieves the same guarantee.**
+
+The winner separates scales across layers instead of mixing them within one.
+Three layers with a 3-token window sweep locally; one layer attends only to
+landmarks every 8 positions. Coverage is then exact by construction: the hub
+layer reaches every landmark, and three local hops sweep 9 positions back from
+each, so the 8-spaced landmark intervals tile the sequence with one to spare.
+
+Note also that **full attention is not how you buy this.** A full layer costs
+8256 edges on its own — more than the entire four-layer local budget of 8160 —
+and the designs using one land at 1.24–1.76×, against 0.33× for a landmark
+layer. Interleaving full attention is what production models do because their
+cheap layers are *linear-attention* layers, which are not a token-graph sparsity
+mechanism at all; within a pure sparse-attention budget it is the expensive
+option.
+
+**The caveat that matters most here**, because it predicts exactly where this
+breaks: reachability is binary. It counts whether a path exists, never whether
+that path can carry anything. A design routing every long-range dependency
+through 16 landmark tokens is the textbook over-squashing bottleneck — an
+exponentially growing neighbourhood forced through a few edges — which is the
+curvature story in `CRITICALITY.md` §2. **So the cheapest-by-reach design is a
+hypothesis to test, not a recommendation**, and the specific prediction is that
+it will underperform its reach number on multi-hop retrieval while the
+small-world masks, which spread their shortcuts, will not.
+
 Caveat that limits all of it: this is graph structure. Which point a task wants
 is not tested, and the reachability metric assumes every edge carries
 information equally, which attention does not.

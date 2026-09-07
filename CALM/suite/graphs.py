@@ -167,6 +167,72 @@ def modular(n: int, block: int, target: int, seed: int) -> Graph:
     return _trim_or_grow(graph, target, rng)
 
 
+def full_mask(n: int) -> Graph:
+    return [set(range(q + 1)) for q in range(n)]
+
+
+def layered_reach(layers: List[Graph], n: int) -> float:
+    """Reachability when each LAYER carries its own mask.
+
+    Every mask above is homogeneous -- the same graph at every layer -- which is
+    the one thing production designs do not do. Gemma-style local/global
+    interleaving and Kimi K3's 3:1 KDA-to-MLA stack both vary the mask by depth,
+    and that is a strictly larger design space: `depth` hops through `depth`
+    different graphs.
+
+    Expansion runs in reverse layer order, because the last layer mixes last and
+    is therefore the first hop away from the output.
+    """
+    total = reached = 0
+    for q in range(n):
+        seen = {q}
+        for graph in reversed(layers):
+            nxt = set(seen)
+            for node in seen:
+                nxt |= graph[node]
+            seen = nxt
+        total += q + 1
+        reached += len(seen & set(range(q + 1)))
+    return reached / total
+
+
+def hub_layer(n: int, w: int, stride: int) -> Graph:
+    """A local window plus landmarks every `stride` positions. `w=0` is hubs only."""
+    graph = window_mask(n, w)
+    for q in range(n):
+        graph[q].update(h for h in range(0, n, stride) if h <= q)
+    return graph
+
+
+def report_layered(n: int, depth: int, seed: int) -> List[Dict]:
+    """Cheapest way to buy FULL depth-limited coverage, homogeneous or not."""
+    baseline = depth * edge_count(window_mask(n, 16))
+    designs = {
+        "homogeneous window w=16": [window_mask(n, 16)] * depth,
+        "homogeneous window w=32": [window_mask(n, 32)] * depth,
+        "homogeneous small-world p=0.03":
+            [small_world(n, 16, 0.03, edge_count(window_mask(n, 16)), s)
+             for s in range(depth)],
+        "homogeneous hubs/16 w=11": [hub_layer(n, 11, 16)] * depth,
+        f"{depth - 1}x window w=16 + 1 FULL":
+            [window_mask(n, 16)] * (depth - 1) + [full_mask(n)],
+        f"{depth - 1}x window w=4 + 1 FULL":
+            [window_mask(n, 4)] * (depth - 1) + [full_mask(n)],
+        f"{depth - 1}x window w=3 + 1 hubs/8 (w=0)":
+            [window_mask(n, 3)] * (depth - 1) + [hub_layer(n, 0, 8)],
+    }
+    rows = []
+    print(f"\n    LAYER-HETEROGENEOUS designs, {depth} layers")
+    print(f"    {'design':>34s} {'edges':>7s} {'vs base':>8s} {'reach':>7s}")
+    for name, layers in designs.items():
+        cost = sum(edge_count(g) for g in layers)
+        reach = layered_reach(layers, n)
+        rows.append({"design": name, "edges": cost, "ratio": cost / baseline,
+                     "reach": reach})
+        print(f"    {name:>34s} {cost:7d} {cost / baseline:7.2f}x {reach:7.4f}")
+    return rows
+
+
 def compressed_bytes(graph: Graph, n: int) -> int:
     bits = bytearray()
     for q in range(n):
@@ -338,20 +404,26 @@ def main():
           f"(reach {sweep[0]['reach']:.3f} at p=0 -> {sweep[-1]['reach']:.3f} at p=1)")
     hub = next(r for r in rows if r["mask"] == "hubs /16")
     wg = next(r for r in rows if r["mask"] == "window+global")
-    print(f"    Q4 window+global reach {wg['reach']:.4f} vs the SAME hub count "
-          f"spread through the sequence {hub['reach']:.4f} -- hub PLACEMENT, "
-          f"not the hub idea")
     bb = next(r for r in rows if r["mask"] == "bigbird")
     print(f"    Q3 bigbird reach {bb['reach']:.4f} at {bb['zlib_bytes']} B; "
           f"nearest sweep point "
           f"{min(sweep, key=lambda r: abs(r['zlib_bytes'] - bb['zlib_bytes']))['mask']}")
-    print(f"    Q4 window+global reach {wg['reach']:.4f} at {wg['zlib_bytes']} B "
-          f"vs p=1 reach {sweep[-1]['reach']:.4f} at {sweep[-1]['zlib_bytes']} B")
-    print("\n    Graph structure only. Which point a task wants is not tested here.")
+    print(f"    Q4 window+global reach {wg['reach']:.4f} vs the SAME hub count "
+          f"spread through the sequence {hub['reach']:.4f} -- hub PLACEMENT, "
+          f"not the hub idea")
+    layered = report_layered(n, depth, options.seed)
+    print("\n    Graph structure only. Which point a task wants is not tested"
+          " here, and\n    reachability is binary: it counts whether a path"
+          " exists, never whether the\n    path has the capacity to carry"
+          " anything. A design that routes everything\n    through 16 landmark"
+          " tokens is the textbook over-squashing bottleneck, so the\n"
+          "    cheapest-by-reach design is a hypothesis to test, not a"
+          " recommendation.")
 
     if options.out:
         Path(options.out).write_text(json.dumps(
-            {"config": vars(options), "budget": budget, "rows": rows}, indent=1))
+            {"config": vars(options), "budget": budget, "rows": rows,
+             "layered": layered}, indent=1))
         print(f"    wrote {options.out}")
 
 

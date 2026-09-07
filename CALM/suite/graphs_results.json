@@ -164,5 +164,49 @@
    "clustering": 0.307930856805397,
    "degree_cv": 0.27724262235597674
   }
+ ],
+ "layered": [
+  {
+   "design": "homogeneous window w=16",
+   "edges": 8160,
+   "ratio": 1.0,
+   "reach": 0.7558139534883721
+  },
+  {
+   "design": "homogeneous window w=32",
+   "edges": 14784,
+   "ratio": 1.811764705882353,
+   "reach": 1.0
+  },
+  {
+   "design": "homogeneous small-world p=0.03",
+   "edges": 8160,
+   "ratio": 1.0,
+   "reach": 1.0
+  },
+  {
+   "design": "homogeneous hubs/16 w=11",
+   "edges": 7800,
+   "ratio": 0.9558823529411765,
+   "reach": 1.0
+  },
+  {
+   "design": "3x window w=16 + 1 FULL",
+   "edges": 14376,
+   "ratio": 1.761764705882353,
+   "reach": 1.0
+  },
+  {
+   "design": "3x window w=4 + 1 FULL",
+   "edges": 10146,
+   "ratio": 1.2433823529411765,
+   "reach": 1.0
+  },
+  {
+   "design": "3x window w=3 + 1 hubs/8 (w=0)",
+   "edges": 2718,
+   "ratio": 0.33308823529411763,
+   "reach": 1.0
+  }
  ]
 }
