@@ -1,0 +1,93 @@
+{
+ "config": {
+  "seq_len": 128,
+  "window": 16,
+  "depth": 4,
+  "seed": 0,
+  "out": "CALM/suite/graphs_results.json"
+ },
+ "budget": 2040,
+ "rows": [
+  {
+   "mask": "p=0.0",
+   "edges": 2040,
+   "zlib_bytes": 87,
+   "reach": 0.7558139534883721,
+   "spectral_gap": 0.030845114961266518,
+   "clustering": 0.763802957688004,
+   "degree_cv": 0.20468497619061707
+  },
+  {
+   "mask": "p=0.01",
+   "edges": 2040,
+   "zlib_bytes": 234,
+   "reach": 0.9964874031007752,
+   "spectral_gap": 0.041960880160331726,
+   "clustering": 0.7383339884084923,
+   "degree_cv": 0.20468497619061707
+  },
+  {
+   "mask": "p=0.03",
+   "edges": 2040,
+   "zlib_bytes": 382,
+   "reach": 0.9993943798449613,
+   "spectral_gap": 0.056978993117809296,
+   "clustering": 0.7048572505407724,
+   "degree_cv": 0.20468497619061707
+  },
+  {
+   "mask": "p=0.1",
+   "edges": 2040,
+   "zlib_bytes": 649,
+   "reach": 0.9979408914728682,
+   "spectral_gap": 0.10288969427347183,
+   "clustering": 0.6101805559171329,
+   "degree_cv": 0.20468497619061707
+  },
+  {
+   "mask": "p=0.3",
+   "edges": 2040,
+   "zlib_bytes": 919,
+   "reach": 0.9917635658914729,
+   "spectral_gap": 0.2383820116519928,
+   "clustering": 0.4217578591188959,
+   "degree_cv": 0.20468497619061707
+  },
+  {
+   "mask": "p=1.0",
+   "edges": 2040,
+   "zlib_bytes": 1075,
+   "reach": 0.7645348837209303,
+   "spectral_gap": 0.6570946574211121,
+   "clustering": 0.3137139014152052,
+   "degree_cv": 0.20468497619061707
+  },
+  {
+   "mask": "window+global",
+   "edges": 2040,
+   "zlib_bytes": 355,
+   "reach": 0.654796511627907,
+   "spectral_gap": 0.16406840085983276,
+   "clustering": 0.7984897576051863,
+   "degree_cv": 0.20468497619061707
+  },
+  {
+   "mask": "bigbird",
+   "edges": 2040,
+   "zlib_bytes": 894,
+   "reach": 0.9979408914728682,
+   "spectral_gap": 0.32940474152565,
+   "clustering": 0.48847366040229057,
+   "degree_cv": 0.2686103771103819
+  },
+  {
+   "mask": "modular",
+   "edges": 2040,
+   "zlib_bytes": 387,
+   "reach": 0.9620881782945736,
+   "spectral_gap": 0.008966011926531792,
+   "clustering": 0.9112134261268084,
+   "degree_cv": 0.5842533124291971
+  }
+ ]
+}
