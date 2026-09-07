@@ -31,6 +31,7 @@ DESIGN.md             the MECE argument, the reading rules, the predictions
 RESULTS.md            round one: depth, state, routing, halting (E0-E4)
 EXPERTS.md            round two: the expert graph (T1-T5)
 ATTENTION.md          round three: the attention temperature (A1-A3)
+CONCLUSION.md         what survived, what died, and the revised architecture
 PARKED.md             E5 and the rest of the brief's list: specified, not run
 results/*.json        one file per run (gitignored, as elsewhere in this repo)
 recur_results.json    all 176 runs consolidated, committed, minus training curves
