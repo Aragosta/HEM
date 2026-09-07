@@ -124,6 +124,45 @@
    "spectral_gap": 0.008966011926531792,
    "clustering": 0.9112134261268084,
    "degree_cv": 0.5842533124291971
+  },
+  {
+   "mask": "hubs /16",
+   "edges": 2040,
+   "zlib_bytes": 461,
+   "reach": 1.0,
+   "reach_1_4": 1.0,
+   "reach_5_16": 1.0,
+   "reach_17_48": 1.0,
+   "reach_49_127": 1.0,
+   "spectral_gap": 0.16956336796283722,
+   "clustering": 0.7377120340729932,
+   "degree_cv": 0.24896519982977605
+  },
+  {
+   "mask": "hubs /32",
+   "edges": 2040,
+   "zlib_bytes": 581,
+   "reach": 1.0,
+   "reach_1_4": 1.0,
+   "reach_5_16": 1.0,
+   "reach_17_48": 1.0,
+   "reach_49_127": 1.0,
+   "spectral_gap": 0.16164451837539673,
+   "clustering": 0.675701488339709,
+   "degree_cv": 0.2296645255997598
+  },
+  {
+   "mask": "dilated",
+   "edges": 2040,
+   "zlib_bytes": 972,
+   "reach": 1.0,
+   "reach_1_4": 1.0,
+   "reach_5_16": 1.0,
+   "reach_17_48": 1.0,
+   "reach_49_127": 1.0,
+   "spectral_gap": 0.4568685293197632,
+   "clustering": 0.307930856805397,
+   "degree_cv": 0.27724262235597674
   }
  ]
 }

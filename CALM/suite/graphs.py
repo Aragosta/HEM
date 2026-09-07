@@ -126,6 +126,35 @@ def bigbird(n: int, w: int, g: int, r: int, target: int, seed: int) -> Graph:
     return _trim_or_grow(graph, target, rng)
 
 
+def strided_hubs(n: int, w: int, stride: int, target: int, seed: int) -> Graph:
+    """Hubs spread through the sequence, not parked at the start.
+
+    The distinction matters only in a causal graph, and it is decisive there. A
+    hub at position h can only ever carry information about positions <= h, so a
+    path routed through it is a dead end for any target above h. Hubs at 0..3 --
+    the Longformer/StreamingLLM "global tokens" or attention sinks -- therefore
+    shorten paths to tokens that were already reachable and relay nothing.
+    Spreading the same number of hubs across the sequence restores the relay.
+    """
+    rng = random.Random(seed)
+    graph = window_mask(n, w)
+    for q in range(n):
+        graph[q].update(h for h in range(0, n, stride) if h <= q)
+    return _trim_or_grow(graph, target, rng)
+
+
+def dilated(n: int, w: int, target: int, seed: int) -> Graph:
+    """Powers-of-two offsets: log(n) shortcuts per token, deterministic."""
+    rng = random.Random(seed)
+    graph = window_mask(n, w)
+    for q in range(n):
+        offset = 1
+        while offset <= q:
+            graph[q].add(q - offset)
+            offset *= 2
+    return _trim_or_grow(graph, target, rng)
+
+
 def modular(n: int, block: int, target: int, seed: int) -> Graph:
     """Hierarchical blocks: dense inside a block, one link to the block before."""
     rng = random.Random(seed)
@@ -269,6 +298,9 @@ def main():
     masks["window+global"] = window_global(n, w - 4, 4, budget, options.seed)
     masks["bigbird"] = bigbird(n, w - 6, 3, 3, budget, options.seed)
     masks["modular"] = modular(n, 2 * w, budget, options.seed)
+    masks["hubs /16"] = strided_hubs(n, w - 5, 16, budget, options.seed)
+    masks["hubs /32"] = strided_hubs(n, w - 4, 32, budget, options.seed)
+    masks["dilated"] = dilated(n, 4, budget, options.seed)
 
     print(f"    {'mask':>14s} {'zlib B':>7s} {'reach':>7s} "
           f"{'near':>7s} {'window':>7s} {'mid':>7s} {'far':>7s} {'gap':>7s}")
@@ -304,7 +336,11 @@ def main():
     best = sweep[1:][gains.index(max(gains))]["mask"] if gains else "n/a"
     print(f"    Q2 reachability per compressed byte is best at {best} "
           f"(reach {sweep[0]['reach']:.3f} at p=0 -> {sweep[-1]['reach']:.3f} at p=1)")
+    hub = next(r for r in rows if r["mask"] == "hubs /16")
     wg = next(r for r in rows if r["mask"] == "window+global")
+    print(f"    Q4 window+global reach {wg['reach']:.4f} vs the SAME hub count "
+          f"spread through the sequence {hub['reach']:.4f} -- hub PLACEMENT, "
+          f"not the hub idea")
     bb = next(r for r in rows if r["mask"] == "bigbird")
     print(f"    Q3 bigbird reach {bb['reach']:.4f} at {bb['zlib_bytes']} B; "
           f"nearest sweep point "

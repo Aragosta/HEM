@@ -709,12 +709,44 @@ reasons.
 `p=0.3`. Its random edges are the shortcuts; it is the same object under another
 name.
 
-**Q4 fails, and this is the finding.** `window+global` has the *worst*
-reachability of anything tested — 0.655, below even the pure window. At a fixed
-edge budget its hub tokens are paid for out of the local window, and a hub
-shortens paths to the *first few positions*, not between mid-sequence pairs. The
-standard sparse-attention design is not near this frontier; on this metric it is
-strictly dominated by rewiring 1% of a plain window.
+**Q4 fails, and the follow-up shows I drew the wrong conclusion from it.**
+`window+global` has the *worst* reachability of anything tested — 0.655, below
+even the pure window, with 0.098 in the far band.
+
+The first reading was that global tokens are a bad design. That is wrong, and a
+one-minute control settles it: the **same number of hubs, spread through the
+sequence instead of parked at positions 0–3**, reaches **1.000 in every band**
+at 461 bytes.
+
+| mask | zlib B | near | window | mid | far |
+|---|---|---|---|---|---|
+| window+global (hubs at 0–3) | 355 | 1.000 | 1.000 | 1.000 | **0.098** |
+| hubs strided /16 | 461 | 1.000 | 1.000 | 1.000 | **1.000** |
+| hubs strided /32 | 581 | 1.000 | 1.000 | 1.000 | **1.000** |
+| dilated (powers of two) | 972 | 1.000 | 1.000 | 1.000 | 1.000 |
+
+So it is **hub placement, not the hub idea** — and the mechanism is the same
+causal asymmetry as before, applied to relays rather than to routes. A hub at
+position `h` can only ever carry information about positions `≤ h`, because
+everything it can read lies below it. Hubs at the start therefore shorten paths
+to tokens that were already reachable and relay nothing. This is why the
+Longformer/BigBird global-token construction does not port to a decoder as-is:
+there, global tokens attend *bidirectionally* and genuinely relay; under a causal
+mask that direction is gone.
+
+Two corrections to the earlier write-up follow. `window+global` is not "the
+standard design" — in a decoder it is the **attention-sink** pattern, whose job
+is softmax stability, not reach. And it is not "dominated": a hub layout that
+respects the causal asymmetry is the best mask measured here.
+
+**A limit of the compressibility proxy, visible in the same table.** Strided hubs
+and dilated offsets are algorithmically trivial — a stride is a handful of bits
+to describe — yet zlib rates them at 461–972 bytes against 234 for the random
+small-world graph, because a row-major bitmap scan does not see column-wise
+periodicity. **zlib understates the compressibility of structured masks**, which
+means the frontier as drawn is pessimistic exactly where a designer would want to
+look. A description length that counted the generating program, not the bitmap,
+would move these points sharply left.
 
 Caveat that limits all of it: this is graph structure. Which point a task wants
 is not tested, and the reachability metric assumes every edge carries
