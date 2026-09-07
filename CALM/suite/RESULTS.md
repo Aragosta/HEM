@@ -799,14 +799,69 @@ included — is about 1% of the loss. That is a statement about a 4-layer model 
 should invert at scale. But within this suite it says T9's ordering of arms
 matters less than whether there is anything to allocate.
 
-## Idea 1 — the random-router control (`triage.py`, G2) — RUNNING
+## Idea 1 — a frozen random router is not worse than a learned one (`triage.py`, G2)
 
-12 paired runs (6 seeds × {learned router, router frozen at random
-initialisation}), MoE `N=4`, `k=2` + 1 shared, at ~5 min each. Still in flight at
-the two-hour mark; results append here when it lands. The number to read is
-**token/expert mutual information**, not perplexity: T2 established that
-perplexity at this budget is noise and that order parameters reproduce to three
-significant figures on the same runs.
+6 paired seeds, MoE `N=4`, `k=2` + 1 shared. Identical initialisation and data
+order; the control's router is frozen at its random init, so the arms differ in
+one thing only.
+
+| seed | learned | frozen | diff (frozen − learned) | load_bal L/F | router entropy L/F |
+|---|---|---|---|---|---|
+| 0 | 163.10 | 162.10 | −1.00 | 0.833 / 0.937 | 0.552 / 0.969 |
+| 1 | 162.82 | 161.79 | −1.03 | 0.790 / 0.916 | 0.506 / 0.969 |
+| 2 | 164.94 | 163.80 | −1.14 | 0.799 / 0.934 | 0.529 / 0.970 |
+| 3 | 165.58 | 165.64 | **+0.06** | 0.826 / 0.920 | 0.460 / 0.970 |
+| 4 | 167.52 | 164.50 | −3.02 | 0.760 / 0.927 | 0.483 / 0.968 |
+| 5 | 165.76 | 163.61 | −2.15 | 0.809 / 0.847 | 0.494 / 0.966 |
+
+Mean −1.38 (−0.84%), sd 1.07, **t = −3.17 against a critical 2.571 at 5 df**.
+Sign test: 5/6, **two-sided p = 0.219**.
+
+**The two tests disagree, so by this suite's own rule (§4.3 of `ALLOCATION.md`)
+the perplexity result is reported as UNRESOLVED.** The t is carried by four small
+consistent differences plus one 3-point outlier; the sign test, which ignores
+magnitude, sees a 5/6 split that six coin flips produce more than a fifth of the
+time. Writing that rule in advance is the only reason it is being applied to a
+result that would otherwise have read as a clean finding.
+
+**What is resolved is the mechanism, and it is 6/6 with no overlap between the
+arms.** The learned router sharpens — router entropy 0.46–0.55 against a frozen
+0.97 — and pays for it in load balance, 0.76–0.83 against 0.85–0.94. Training
+makes the router commit, and committing costs it the even spread that a random
+projection gets for nothing. That is a clean, reproducible effect in exactly the
+instrumentation T2 found survives this budget when perplexity does not.
+
+### The mutual-information column is withdrawn
+
+`expert_mi` was intended to carry this gate. It cannot, and the reason is
+arithmetic, not the models: 1419 distinct BPE types over 16,256 samples gives a
+plug-in (Miller–Madow) MI bias of **0.189 bits** against measured values of
+0.35–0.60. A third to a half of every number in that column is estimator bias.
+
+Worse, the bias is not equal across arms: it grows with the number of occupied
+joint cells, and the frozen arm — which spreads tokens more evenly — occupies
+more of them. **The apparent "frozen router carries more token information" is
+confounded in precisely the direction observed**, so the column supports no
+comparison at all and the runner's automatic verdict line, which reads it,
+should be ignored for this run.
+
+The fix is a permutation null (shuffle expert labels, recompute, subtract) and
+an order of magnitude more eval samples. Both are cheap; neither was in place,
+and reporting the column as-is would have been the third result in this project
+to be a measurement artefact wearing the costume of a finding.
+
+### What it does to the suite
+
+T7's P7.2 said MoE must beat a random router or the effect is capacity, not
+conditional computation. On this evidence the learned router does not beat it,
+and may lose to it. That is not yet a result — 1000 steps, 6 seeds, `N=4`,
+and the two tests disagree — but it is the outcome P7.2 was written to catch,
+and it lands on the premise T8 and T9 both rest on.
+
+The re-scoping the gate calls for: before T8 and T9 ask *which* routing signal is
+best, they must establish that **any** learned routing beats a fixed random
+assignment at matched budget. That is a cheaper experiment than either, and it is
+now the first thing in the DAG after T6.
 
 ## Idea 5 — MDL as the objective — NOT ATTEMPTED
 
