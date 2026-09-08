@@ -1,208 +1,592 @@
-# HELM-MiCE, optimized
+<p align="center">
+  <img src="assets/header_image.png" width="1000" alt="Kimi-K3"/>
+</p>
 
-A port of [HELM](https://github.com/Graph-and-Geometric-Learning/helm)
-("HELM: Hyperbolic Large Language Models via Mixture-of-Curvature Experts",
-[arXiv:2505.24722](https://arxiv.org/abs/2505.24722))
-with a rewritten HELM-MiCE — hyperbolic multi-head latent attention (HMLA) plus a
-mixture of curvature experts (MiCE) — that runs faster and, unlike the original,
-can actually be evaluated.
+--- 
 
-The published implementation is kept byte-for-byte in `helm/reference/` as the
-correctness baseline. Every optimization is an algebraic rewrite or a scheduling
-change, not an approximation, and `tests/` pins that down in float64 against the
-original.
+### A research-scale Kimi K3 reproduction—from 213M single-T4 profiles to the canonical topology in pure PyTorch
 
+[![CI](https://github.com/pablo-reyes8/kimi-k3/actions/workflows/ci.yml/badge.svg)](https://github.com/pablo-reyes8/kimi-k3/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.2%2B-EE4C2C.svg?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/status-active_research-orange.svg)](#project-status)
+
+Kimi-K3 Mini is a pure-PyTorch reproduction of the core architectural, training, and inference mechanisms introduced in Kimi K3. It scales the frontier system down into readable, modular components that you can validate locally on a CPU, compose via strict YAML profiles, and rapidly scale up for real GPU experiments.
+
+This is not just a Transformer renamed after Kimi. The repository delivers a faithful, from-scratch reconstruction of the paper's main innovations: Kimi Delta Attention, Gated Multi-head Latent Attention, the hybrid 3:1 backbone, and Stable LatentMoE. Built with multimodal research in mind, it also includes native MoonViT integration, Attention Residuals, MTP, progressive context training, and cached autoregressive inference.
+
+> [!IMPORTANT]
+> This is an independent research implementation. It is not affiliated with
+> Moonshot AI, does not ship official or trained weights, and does not reproduce
+> Moonshot's production PP/VP/CP/MoonEP system, data mixture or custom kernels.
+
+## Contents
+
+- [Complete YAML profiles](#complete-yaml-profiles)
+- [Why this repository exists](#why-this-repository-exists)
+- [Implementation status](#implementation-status)
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Supported data](#supported-data)
+- [Training](#training)
+- [Inference](#inference)
+- [Testing and CI](#testing-and-ci)
+- [Docker](#docker)
+- [Repository layout](#repository-layout)
+- [Documentation](#documentation)
+- [Project status](#project-status)
+- [Citation and license](#citation-and-license)
+
+## Why this repository exists
+
+Large-model reports are easiest to understand when their mechanisms can be
+isolated, inspected and tested. This project provides:
+
+- paper-oriented modules instead of one opaque model file;
+- exact behavioral tests for equations, causality, masks, caches and gradients;
+- tiny CPU configurations for development and larger research profiles;
+- one public training orchestration path;
+- one public autoregressive inference path;
+- explicit boundaries between implemented research code and future systems
+  work.
+
+The canonical topology is represented as validated metadata, while smaller
+profiles make the same composition practical for local experimentation.
+The architectural reference bundled with the repository is
+[_Kimi K3: Open Frontier Intelligence_](paper/k3_tech_report.pdf).
+
+## Complete YAML profiles
+
+The center of the repository is a ladder of complete experiments. Every
+profile binds the dataset, architecture and training recipe into one directory:
+
+```text
+config/kimi_full_pipeline/<profile>/
+├── data.yaml
+├── model.yaml
+└── training.yaml
 ```
-helm/modules/     optimized HMLA, MiCE and the model
-helm/eval/        lm-evaluation-harness plugin, batched scoring, generation
-helm/reference/   the published modules, unmodified
-helm/hypercore/   vendored HyperCore layers (graph datasets dropped)
-tests/            71 parity and regression tests
-benchmarks/       reference vs optimized, timing + memory + op counts
-docs/             what changed and why
-```
 
-Deliberately not ported from upstream: `figure/` (images),
-`helm/hypercore/data/` (219 MB of graph-learning datasets, unrelated to the
-language model), and the 47 MB vendored `lm-evaluation-harness/` fork — whose
-HELM-specific parts are reimplemented in `helm/eval/` as a plugin, so the model
-code exists once instead of twice. Everything else is present.
+### Choose a compute budget
 
-## Install
+| Profile        | Total / active parameters | Approx. train compute | GPU target                   |                        Context | Data                |
+| -------------- | ------------------------: | --------------------: | ---------------------------- | -----------------------------: | ------------------- |
+| `cpu_smoke`    |             0.05M / 0.04M |    <0.001 GFLOP/token | CPU                          |                             32 | Synthetic retrieval |
+| `low_gpu`      |             87.2M / 56.6M |      0.34 GFLOP/token | Conservative T4              |                            512 | WikiText-2          |
+| `t4_wikitext`  |           212.9M / 108.5M |      0.65 GFLOP/token | T4 16 GB (~15 usable) target |                          1,024 | WikiText-2          |
+| `t4_retrieval` |           246.6M / 120.2M |      0.72 GFLOP/token | T4 16 GB (~15 usable) target |                512 → 2,048 PCC | Synthetic retrieval |
+| `gpu_24gb`     |           371.3M / 190.9M |      1.15 GFLOP/token | 24 GB GPU                    |                          1,024 | FineWeb 10BT        |
+| `gpu_48gb`     |          1.482B / ~556.7M |     ~3.34 GFLOP/token | 48 GB GPU                    |                      8,192 PCC | FineWeb 100BT       |
+| `gpu_80gb`     |           ≥7.66B / ≥1.91B |    ≥11.46 GFLOP/token | 80 GB GPU                    |                      8,192 PCC | FineWeb 350BT       |
+| `canonical`    |               2.8T / 104B |      ≈624 GFLOP/token | Distributed metadata         | 8,192 recipe / 1M architecture | FineWeb 350BT       |
+
+Active-parameter estimates account for sparse top-k experts. Training compute
+uses the common `6 × active parameters` approximation per token. It is a scale
+indicator, not measured throughput: attention, KDA recurrence, routing,
+MoonViT, MTP, sequence length and kernels add workload. The remaining `≥` row
+reports the text stack before the additional visual path. GPU labels are starting targets;
+peak memory must be measured on the actual PyTorch/CUDA stack.
+
+### Distributed launch profiles
+
+The same three-YAML control plane now describes the process topology. These
+profiles are executable PyTorch baselines, not production-system claims:
+
+| Profile | Processes | Composition | Starting hardware/data |
+|---|---:|---|---|
+| `distributed_ddp_2x_t4` | 2 | 2-way DDP | 2 × T4, synthetic retrieval |
+| `distributed_tp_2x_24gb` | 2 | 2-way complete-head TP | 2 × 24 GB, FineWeb 10BT |
+| `distributed_tp_ep_4x_24gb` | 4 | 2-way TP × 2-way EP | 4 × 24 GB, FineWeb 10BT |
+
+Validate topology, divisibility and the exact launch command without building
+data or allocating the model:
 
 ```bash
-pip install torch geoopt                 # core model
-pip install -r requirements.txt          # + training stack (accelerate, llmfoundry, ...)
+python -m scripts.validate_distributed_config \
+  --profile config/kimi_full_pipeline/distributed_tp_ep_4x_24gb
 ```
 
-The language model needs only `torch` and `geoopt`. The graph and vision parts of
-HyperCore pull in `torch_geometric`, `torch_scatter`, `torchvision` and `sklearn`,
-but they are imported lazily, so you do not need them to train or run an LM.
+Launch the same validated profile:
 
-## Use
+```bash
+torchrun --standalone --nproc_per_node=4 \
+  -m scripts.train_kimi \
+  --profile config/kimi_full_pipeline/distributed_tp_ep_4x_24gb
+```
+
+### Two practical T4 starting points
+
+The new T4 profiles use the small vocabulary or corpus size differently:
+retrieval spends the saved embedding budget on width and context, while
+WikiText keeps a larger language vocabulary.
+
+| Architecture field        |           `t4_retrieval` |            `t4_wikitext` | Canonical metadata |
+| ------------------------- | -----------------------: | -----------------------: | -----------------: |
+| Total / active parameters |          246.6M / 120.2M |          212.9M / 108.5M |        2.8T / 104B |
+| Hybrid attention stack    |            9 KDA + 4 MLA |            9 KDA + 4 MLA |    69 KDA + 24 MLA |
+| Model width               |                      704 |                      640 |              7,168 |
+| Heads / head size         |                  11 / 64 |                  10 / 64 |           56 / 128 |
+| Routed experts            |                12, Top-2 |                12, Top-2 |        896, Top-16 |
+| Latent MoE width          |                      352 |                      320 |              3,584 |
+| Vocabulary                |  2,048 controlled tokens |       16K byte-level BPE |               160K |
+| Context recipe            |       PCC: 512 → 1K → 2K |                 Fixed 1K |      Configured 8K |
+| Optimizer                 |    Per-Head Muon + AdamW |    Per-Head Muon + AdamW |       Muon + AdamW |
+| Vision                    | Disabled for T4 headroom | Disabled for T4 headroom |            MoonViT |
+
+At a rough 12–16 bytes per parameter for weights, gradients and mixed
+optimizer state, persistent model state is approximately 2.8–3.7 GiB for
+`t4_retrieval` and 2.4–3.2 GiB for `t4_wikitext`. Activations, attention
+workspaces, routing buffers, CUDA context and fragmentation consume the
+remaining VRAM; this is why both recipes use microbatch 1, accumulation, FP16
+and no EMA.
+
+Scaling down does not replace the defining blocks with a generic Transformer.
+Both T4 profiles retain the `3 KDA : 1 Gated MLA` rhythm, ShortConv KDA,
+Stable LatentMoE, Block Attention Residuals, Quantile Balancing, MTP,
+Kimi-aware optimization and native KDA/MLA cached decoding.
+
+### Validate, train and generate
+
+Validate all three YAML contracts without downloading data or allocating the
+model:
+
+```bash
+PROFILE=config/kimi_full_pipeline/t4_retrieval
+python -m scripts.validate_data_config "$PROFILE/data.yaml"
+python -m scripts.validate_model_config "$PROFILE/model.yaml"
+python -m scripts.train_kimi --profile "$PROFILE" --validate-only
+```
+
+Start a real run only when the selected data and hardware are ready:
+
+```bash
+python -m scripts.train_kimi \
+  --profile config/kimi_full_pipeline/t4_retrieval
+```
+
+After training, use the same profile for cached generation:
+
+```bash
+python -m scripts.infer_kimi \
+  --profile config/kimi_full_pipeline/t4_retrieval \
+  --checkpoint checkpoints/t4_retrieval_246m/model.pt \
+  --inference-config config/inference/creative.yaml \
+  --prompt "key_7 is value_42"
+```
+
+Interactive walkthroughs:
+
+- [Train from one complete YAML profile](notebooks/train_kimi_k3_from_yaml.ipynb)
+- [Run autoregressive cached inference](notebooks/inference_kimi_k3_from_checkpoint.ipynb)
+
+Unknown YAML fields fail loudly, and cross-profile contracts are validated
+before the data or model is built.
+
+## Implementation status
+
+| Area                    | Included                                                                                                         |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Kimi Delta Attention    | Recurrent, chunkwise, prefill and decode paths; short-convolution state; data-dependent decay; FP32 accumulation |
+| Gated MLA               | NoPE global attention, compressed latent KV, full-rank output gate, manual/SDPA backends and cache               |
+| Hybrid backbone         | Repeated `3 KDA + 1 Gated MLA`, final global MLA and synchronized heterogeneous cache                            |
+| Stable LatentMoE        | Shared experts, latent routed experts, sparse top-k dispatch, exact/histogram Quantile Balancing                 |
+| Attention Residuals     | Full and Block AttnRes with eager and exact two-phase execution                                                  |
+| Vision                  | MoonViT, hierarchical and Swin variants, pixel shuffle, projection and image/video token composition             |
+| MTP                     | One auxiliary `x[t+2]` prediction group with normalized fusion and shared LM head                                |
+| Objectives              | NTP, MTP, trajectory SFT, policy optimization and multi-teacher on-policy distillation                           |
+| Training                | Train/eval epochs, AMP, accumulation, EMA, checkpoints, scheduler, previews and structured diagnostics           |
+| Kimi optimizers         | AdamW, Muon/AdamW hybrid, per-head QKV handling and QK-Clip                                                      |
+| Long-context curriculum | Optional Progressive Context Curriculum with resumable stage state                                               |
+| Distributed execution   | DDP, FSDP boundary, complete-head KDA/MLA TP, tied vocabulary shards, no-drop MoE EP and atomic rank checkpoints |
+| Inference               | Checkpoint restoration, greedy/sampling generation and native KDA/MLA cached decode                              |
+| Configuration           | Strict data/model/training YAMLs grouped into complete experiment profiles                                       |
+
+The full component map is available in
+[`src/kimi_components/README.md`](src/kimi_components/README.md).
+
+## Architecture
+
+```text
+text token IDs ──> token embeddings ──────────────┐
+                                                  │
+images/videos ──> MoonViT ─> projector/composer ──┤
+                                                  ▼
+
+                                    repeated hybrid groups
+                                  [3 × KDA + 1 × Gated MLA]
+                                            │
+                                Stable LatentMoE after attention
+                                            │
+                                Full or Block Attention Residuals
+                                            │
+                                  final global Gated MLA + MoE
+                                            │
+                                    RMSNorm + tied LM head
+                                      ┌─────┴─────┐
+                                  NTP logits   MTP x[t+2]
+```
+
+The canonical metadata profile describes:
+
+- `d_model = 7168`;
+- 56 attention heads;
+- 23 hybrid groups plus the final Gated MLA, for 93 attention layers;
+- 896 routed experts with 16 selected per token;
+- a 160,000-token model vocabulary;
+- MoonViT visual encoding and one MTP group.
+
+Loading the canonical YAML validates this topology without allocating its
+weights. Do not instantiate it casually.
+
+## Installation
+
+Python 3.10 or newer is required.
+
+```bash
+git clone https://github.com/pablo-reyes8/kimi-k3.git
+cd kimi-k3
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev,data]"
+```
+
+On Windows PowerShell:
+
+```powershell
+.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev,data]"
+```
+
+The minimal architecture/inference dependencies are installed with
+`pip install -e .`. The `data` extra adds Hugging Face datasets and
+tokenizers; `dev` adds pytest.
+
+## Quick start
+
+Validate a complete low-GPU experiment without downloading data, allocating a
+model or training:
+
+```bash
+python -m scripts.train_kimi \
+  --profile config/kimi_full_pipeline/t4_retrieval \
+  --validate-only
+```
+
+The same operation through the Makefile:
+
+```bash
+make validate PROFILE=config/kimi_full_pipeline/t4_retrieval
+```
+
+Interactive examples:
+
+- [`notebooks/train_kimi_k3_from_yaml.ipynb`](notebooks/train_kimi_k3_from_yaml.ipynb)
+- [`notebooks/inference_kimi_k3_from_checkpoint.ipynb`](notebooks/inference_kimi_k3_from_checkpoint.ipynb)
+
+## Supported data
+
+The data orchestrator owns tokenization, causal blocks, loaders and the
+context-aware loader factory used by PCC.
+
+| Family                    | Presets                                              |
+| ------------------------- | ---------------------------------------------------- |
+| Local synthetic           | Deterministic long-context key/value retrieval       |
+| Compact Hugging Face text | WikiText-2, TinyStories, AG News, IMDB, MiniPile     |
+| Educational web           | FineWeb-Edu 10BT-mincols                             |
+| Progressive LLM scale     | FineWeb`sample-10BT`, `sample-100BT`, `sample-350BT` |
+
+Hugging Face profiles can cap tokenizer, train and validation documents and
+cache a byte-level BPE tokenizer. The three FineWeb profiles enable streaming
+and document caps by default so selecting one does not eagerly download the
+27.6 GB, 277.4 GB or roughly 388 GB remote source. Unit tests never download
+datasets.
+
+Standalone YAMLs for these sources live under [`config/data/`](config/data/).
+Removing the document caps is an explicit large-scale operation and should
+only be done with a deliberate storage and preprocessing plan.
+
+Build a configured data bundle:
 
 ```python
-import torch
-from helm.hypercore.manifolds import Lorentz
-from helm.modules.helm_mice import HelmMiCE
-from config.args import parser
+from data import build_dataloaders_from_yaml
 
-args = parser.parse_args([])
-model = HelmMiCE(args, Lorentz(1.0), Lorentz(1.0), Lorentz(1.0))
-
-tokens = torch.randint(0, args.vocab_size, (2, 512))
-logits, expert_indices, routing_scores = model(tokens)   # train mode
-
-model.eval()
-with torch.no_grad():
-    logits = model(tokens)                               # eval mode (upstream raises here)
+data = build_dataloaders_from_yaml(profile.data)
+train_loader = data.train_loader
+val_loader = data.val_loader
 ```
 
-Incremental decoding, using the KV cache that upstream ships commented out:
+For inference, `load_tokenizer_from_data_yaml` reconstructs the deterministic
+synthetic tokenizer or loads the cached tokenizer without rebuilding loaders.
+
+## Training
+
+The notebook and CLI use three public calls in order:
 
 ```python
-caches = model.new_kv_caches(max_batch_size=2)      # latent (MLA) cache
-logits = model(tokens[:, :prefill], caches=caches)  # prefill
-for i in range(prefill, tokens.size(1)):
-    logits = model(tokens[:, i:i + 1], start_pos=i, caches=caches)
+from data import build_dataloaders_from_yaml
+from src import build_model_from_yaml
+from training import train_kimi_from_yaml
+
+data = build_dataloaders_from_yaml(profile.data)
+model = build_model_from_yaml(profile.model, data_bundle=data)
+history = train_kimi_from_yaml(
+    profile.training,
+    model=model,
+    data=data,
+)
 ```
 
-The cache stores the compressed MLA latent and the shared rotary key, not the
-reconstructed per-head keys and values — **6.1× smaller at the 120M shape,
-14.1× at 1B**. Pass `mode="naive"` to spend that memory instead and skip the
-`wkv_b` reconstruction each step.
+`train_kimi_from_yaml` validates cross-file invariants and delegates to the
+single master orchestrator, `train_kimiK3`. The training YAML controls:
 
-## Evaluate
+- precision, epochs, accumulation and gradient clipping;
+- NTP/MTP loss configuration;
+- AdamW or Kimi-style Muon/AdamW parameter groups;
+- warmup and cosine scheduling;
+- EMA and EMA evaluation;
+- structured loss, routing, gradient and numerical diagnostics;
+- progressive context stages;
+- checkpoint/resume behavior;
+- periodic next-token qualitative previews.
+
+To start a real run from the CLI, remove `--validate-only`:
 
 ```bash
-lm_eval --model helm_mice_120M \
-        --model_args ckpt_dir=/path/to/Step1000.pt,batch_size=16 \
-        --tasks hellaswag,arc_challenge --num_fewshot 0
+python -m scripts.train_kimi \
+  --profile config/kimi_full_pipeline/t4_retrieval
 ```
 
-`helm/eval/` registers `helm_mice_120M`, `helm_mice_1B` and `helm_d_115M` against
-an installed `lm_eval`. It batches requests (the original scores one continuation
-per forward pass and ignores `batch_size`), gathers log-probabilities vectorised,
-and implements `generate_until` and `loglikelihood_rolling` — neither of which
-works upstream.
+This may download/tokenize data and allocate the configured model.
 
-Checkpoints are interchangeable with the reference in both directions:
+Distributed profiles use the same master function and are launched with
+`torchrun`; the YAML remains the source of truth:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  -m scripts.train_kimi \
+  --profile config/kimi_full_pipeline/distributed_ddp_2x_t4
+```
+
+The model is transformed in place: KDA and MLA own complete local heads,
+KDA recurrent/ShortConv caches follow those heads, MLA keeps the compressed
+latent cache replicated, tied vocabulary weights are sharded once, and routed
+experts use no-drop variable `all_to_all`. DDP/EP token losses and PCC counters
+are reduced by valid-token count. Pipeline and context parallel sizes are
+strictly reserved at `1` in this phase.
+
+## Inference
+
+Inference restores the architecture from `model.yaml`, loads a training
+checkpoint and performs one prompt prefill followed by one cached decode step
+per generated token:
+
+```text
+prompt -> KimiK3.prefill() -> HybridBackboneCache
+       -> KimiK3.decode_step() -> next token -> repeat
+```
+
+KDA layers retain recurrent matrix and short-convolution state; MLA layers
+retain compressed latent KV state. The full prefix is not recomputed.
 
 ```python
-model.load_state_dict(torch.load("upstream.pt")["model_state_dict"], strict=False)
+from data import load_tokenizer_from_data_yaml
+from inference import (
+    ModelLoadConfig,
+    inference_autoregressive,
+    load_generation_config,
+    load_kimi_checkpoint,
+)
+
+tokenizer = load_tokenizer_from_data_yaml(profile.data)
+loaded = load_kimi_checkpoint(
+    profile.model,
+    "checkpoints/model.pt",
+    tokenizer=tokenizer,
+    load_config=ModelLoadConfig(device="cuda", precision="fp16"),
+)
+generation = load_generation_config("config/inference/creative.yaml")
+output = inference_autoregressive(
+    loaded.model,
+    "Once upon a time",
+    tokenizer=tokenizer,
+    generation_config=generation,
+)
+print(output.completion_text)
 ```
 
-## Train
+CLI:
 
 ```bash
-bash example/train_mice_120M.sh
+python -m scripts.infer_kimi \
+  --profile config/kimi_full_pipeline/t4_wikitext \
+  --checkpoint checkpoints/model.pt \
+  --inference-config config/inference/creative.yaml \
+  --prompt "Once upon a time"
 ```
 
-or directly, with the optimization flags:
+Sampling supports greedy decoding, temperature, top-k, top-p, repetition
+penalty and deterministic seeds. See [`inference/README.md`](inference/README.md).
+
+Two-way cached inference can use
+`config/inference/distributed_greedy_tp2.yaml` under `torchrun`. It expects a
+consolidated trusted checkpoint; same-topology training checkpoints remain
+rank-sharded directories.
+
+> [!WARNING]
+> Only load checkpoints from trusted sources. PyTorch checkpoint
+> deserialization is not a safe boundary for arbitrary files.
+
+## Testing and CI
+
+Tests are treated as architectural specifications. They check reference
+equations, parameter wiring, causality, padding, gradients, BF16 behavior,
+serialization and full-vs-cached equivalence—not only output shapes.
 
 ```bash
-accelerate launch --mixed_precision bf16 train.py \
-    --model_name HELM_MiCE --dim 390 --n_layers 6 --n_heads 6 \
-    --attn_impl flash --fuse_experts True --grad_checkpoint False --compile False
+make check             # configuration + inference contracts
+make test-config
+make test-inference
+make test-training
+make test-distributed
+make test              # complete CPU-safe suite
 ```
 
-| Flag | Default | Effect |
-| --- | --- | --- |
-| `--attn_impl` | `flash` | `flash` fuses the hyperbolic scores into `scaled_dot_product_attention`; `naive` is the literal published formulation |
-| `--rope_impl` | `auto` | `complex` in eager, `real` under `torch.compile` — measured, they invert |
-| `--fuse_experts` | `True` | One GEMM for the SwiGLU gate/up projections instead of two |
-| `--grad_checkpoint` | `False` | Recompute block activations in the backward pass |
-| `--compile` | `False` | Wrap the model in `torch.compile` (with the real rope, 1.53× on a block) |
-| `--ce_chunk_size` | `512` | Tokens per block in the fused head |
-| `--balance_update` | `True` | Apply the auxiliary-loss-free routing-bias update (dead code upstream) |
+The GitHub Actions workflow classifies changed paths:
 
-## Results
+| Change                                                    | CI lane                                                  |
+| --------------------------------------------------------- | -------------------------------------------------------- |
+| README/docs/community files only                          | Classification only; no full test suite                  |
+| YAML/configuration                                        | Profile parsers, cross-file contracts and CLI validation |
+| Inference/cache code                                      | Focused inference tests                                  |
+| Architecture, data, training, dependencies or broad tests | Full CPU suite plus CLI validation                       |
+| Docker files                                              | Container build and focused container smoke              |
 
-Measured on CPU at the 120M shape (fp32, batch 2). CPU has no FlashAttention
-kernel, so these are *lower* bounds:
+Workflows use read-only token permissions, concurrency cancellation and pinned
+action revisions. CUDA checks skip safely when CUDA is unavailable.
 
-| | reference | optimized | speedup |
-| --- | --- | --- | --- |
-| attention, seq 1024 | 97.2 ms | 57.0 ms | **1.71×** |
-| attention, seq 2048 | 363.9 ms | 233.1 ms | **1.56×** |
-| whole model forward, seq 1024 | 1752.7 ms | 1367.1 ms | **1.28×** |
-| whole model forward, seq 2048 | 4058.0 ms | 3015.5 ms | **1.35×** |
-| **full training step, seq 1024** | **11.9 s / 7045 MiB** | **5.7 s / 3518 MiB** | **2.09× / 2.0× less memory** |
+The detailed invariant matrix is in [`docs/testing.md`](docs/testing.md).
 
-Two things drive the training-step number. Attention never builds its
-`(B, H, N, N)` score matrix, so its peak allocation roughly halves (384 → 195 MiB
-at seq 2048). And the LM head — 50M of the model's 107M parameters, because
-`dim=390` meets a 128256-entry vocabulary — no longer materialises **3.9 GiB** of
-float32 logits; `labels=` runs a chunked fused cross-entropy that also skips the
-padded positions before the projection instead of after.
+## Docker
 
-Two wins here are **unmeasured**, because this was developed on a CPU-only
-machine: eliminating the MoE's per-expert device syncs needs an asynchronous
-device to matter, and `is_causal=True` only skips the masked half of the
-attention matrix under a real FlashAttention kernel. Run the benchmark on a GPU
-before quoting a number:
+The supplied image is a reproducible CPU validation/inference environment. It
+uses a multi-stage build, installs optional data dependencies and runs as a
+non-root user.
 
 ```bash
-python benchmarks/bench_helm_mice.py --preset 120m --seq-len 2048 --dtype bfloat16
+docker compose run --rm validate
+docker compose --profile test run --rm tests
+docker compose --profile dev run --rm shell
 ```
 
-## Is the output the same?
-
-Yes — and the tests are built to demonstrate it rather than assert it.
+Checkpoint inference:
 
 ```bash
-python -m pytest tests/ -q       # 71 tests
+KIMI_CHECKPOINT=checkpoints/model.pt \
+KIMI_PROMPT="Once upon a time" \
+docker compose --profile inference run --rm inference
 ```
 
-* **Turn every rewrite off and it is bit-identical.** `attn_impl="naive"`,
-  `rope_impl="complex"`, `fuse_experts=False`, `fuse_residual=False` gives the
-  literal published formulation; what remains is pure scheduling, and logits,
-  routing indices and routing scores all match under `torch.equal`.
-* **With everything on, step-0 logits are still bit-identical** and gradients
-  differ by ~1e-17 in float64 — the fused GEMM and SDPA just sum in a different
-  order.
-* **Over a training run that round-off gets amplified, by exactly as much as
-  round-off is.** Take the reference, move **one weight by a single ULP**, and
-  train both for 60 Adam steps:
+The checkpoint and tokenizer-cache mounts are read-only. GPU execution needs a
+CUDA-compatible PyTorch base image/runtime and is intentionally not implied by
+the default CPU container.
 
-  | | worst weight drift |
-  | --- | --- |
-  | reference vs. reference + 1 ULP | 9.5e-06 |
-  | reference vs. optimized | 6.6e-06 |
+## Repository layout
 
-  The optimized model ends up closer to the reference than the reference is to
-  itself under a one-ULP perturbation, and the loss curves track to 5e-07. This
-  is the same order of drift you get from changing BLAS threads or GPU model.
+```text
+.
+├── config/kimi_full_pipeline/  # complete data/model/training profiles
+├── configuration/              # strict YAML and profile resolution
+├── data/                       # synthetic and Hugging Face LM pipelines
+├── src/                        # KDA, MLA, MoE, AttnRes, vision, MTP, losses
+├── training/                   # master trainer, optimizer, diagnostics, PCC
+├── inference/                  # loading, sampling, prefill/decode and cache
+├── scripts/                    # training, inference and validation CLIs
+├── notebooks/                  # end-to-end Jupyter examples
+├── tests/                      # CPU-safe behavioral and numerical tests
+├── docs/                       # phase reports and public contracts
+├── paper/                      # local technical-report reference
+├── Dockerfile
+├── docker-compose.yml
+└── Makefile
+```
 
-The one deliberate difference is the attention bias, a scalar added to every
-score before a softmax — it provably cannot change any output, so it is frozen
-here while upstream trains it on round-off.
+## Documentation
 
-Details in **[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md)** (the attention
-and MoE rewrites) and **[`docs/UPGRADES.md`](docs/UPGRADES.md)** (the fused head,
-the latent KV cache, the evaluation port, and what was measured and rejected).
+Recommended entry points:
 
-## What was wrong with the original
+- [YAML training pipeline](docs/yaml_training_pipeline.md)
+- [Kimi component map](src/kimi_components/README.md)
+- [Master forward contract](docs/kimi_k3_forward_contract.md)
+- [KDA implementation report](docs/kda_phase_report.md)
+- [Gated MLA implementation report](docs/mla_phase_report.md)
+- [Hybrid backbone report](docs/hybrid_backbone_phase_report.md)
+- [Stable LatentMoE report](docs/stable_latent_moe_phase_report.md)
+- [Attention Residuals report](docs/attention_residuals_phase_report.md)
+- [MTP alignment and scope](docs/mtp_phase_report.md)
+- [Training engine](docs/basic_training_phase_report.md)
+- [Optimizer and diagnostics](docs/training_phase_2_optimizer_diagnostics_report.md)
+- [Progressive Context Curriculum](docs/training_phase_3_progressive_context_curriculum_report.md)
+- [Distributed parallelism](docs/distributed_parallelism_phase_report.md)
+- [Distributed training guide](docs/distributed_training.md)
+- [Distributed inference and cache guide](docs/distributed_inference_and_cache.md)
 
-Nine bugs surfaced while porting, including one that makes the released model
-unusable outside training (`Gate` returns 2 values in eval mode, `LorentzMoE`
-unpacks 3), one that stops it being built from its own config at all
-(`mice_inter_dim` vs `moe_inter_dim`), and one that silently corrupts the model
-on `.bfloat16()`. The full
-list, with what each one breaks, is in
-**[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md)**.
+## Project status
 
-## Credit
+The architecture, pretraining engine, YAML control plane, PyTorch-native
+DP/TP/EP baseline and cached inference pipeline are implemented. The remaining
+public milestones are:
 
-Model, method and the HyperCore layers are the work of the HELM authors
-(Yale Graph and Geometric Learning group), Apache-2.0 — see `LICENSE`. If you use
-this, cite the paper:
+1. **Train a proof model — in progress.** Run and publish a small end-to-end
+   checkpoint with reproducible curves and qualitative generations.
+2. **Integrate post-training.** SFT, RL/policy-optimization and multi-teacher
+   distillation losses already exist under `src/loss/`; their datasets,
+   rollout/teacher orchestration and checkpointed training pipeline remain to
+   be connected.
+3. **Measure and tune distributed GPU profiles.** Publish real memory,
+   throughput and scaling measurements; PP, KDA context parallelism and
+   MoonEP-style production kernels remain explicitly out of scope.
+
+Production serving kernels, paged attention, continuous batching, quantized
+caches and speculative MTP decoding are also outside the current scope.
+
+## Citation and license
+
+GitHub exposes citation metadata from [`CITATION.cff`](CITATION.cff). Please
+cite the original Kimi K3 technical report first:
 
 ```bibtex
-@article{he2025helm,
-  title={HELM: Hyperbolic Large Language Models via Mixture-of-Curvature Experts},
-  author={He, Neil and Anand, Rishabh and Madhu, Hiren and Maatouk, Ali and Krishnaswamy, Smita and Tassiulas, Leandros and Yang, Menglin and Ying, Rex},
-  journal={arXiv preprint arXiv:2505.24722},
-  year={2025},
+@techreport{kimi_team_kimi_k3_2026,
+  author        = {{Kimi Team}},
+  title         = {Kimi K3: Open Frontier Intelligence},
+  year          = {2026},
+  eprint        = {2607.24653},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL},
+  doi           = {10.48550/arXiv.2607.24653},
+  url           = {https://arxiv.org/abs/2607.24653}
 }
 ```
+
+If this implementation itself was useful, cite the software as well:
+
+```bibtex
+@software{reyes_kimi_k3_mini_2026,
+  author  = {Pablo Reyes},
+  title   = {Kimi-K3 Mini},
+  year    = {2026},
+  url     = {https://github.com/pablo-reyes8/kimi-k3},
+  version = {0.0.1}
+}
+```
+
+The project is released under the [MIT License](LICENSE). Generic Transformer,
+data and training infrastructure was adapted from the author's MIT-licensed
+DeepSeek-V4 Mini project; there are no runtime imports from that repository.
+Kimi K3 itself and its technical report are the work of the Kimi Team.
+
+Contributions are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md),
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) and [`SECURITY.md`](SECURITY.md)
+before opening a pull request or report.
