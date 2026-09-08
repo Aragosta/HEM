@@ -45,11 +45,20 @@ class PatchAutoencoderConfig:
     ffn_multiplier: int = 4
     rms_norm_eps: float = 1e-6
     dropout: float = 0.0
-    kl_weight: float = 1.0
-    # Per-dimension floor on the KL. Without it the codec drives log_std to
-    # -inf, the posterior becomes a point mass, and the energy target the head
-    # is asked to match loses the spread that makes the score proper.
-    kl_clamp: float = 0.0
+    # The reference CALM autoencoder uses 1e-3, and this constant matters far
+    # more than a regularisation weight usually does. At kl_weight = 1.0 the
+    # codec is pushed to a near-prior posterior: measured here, the posterior
+    # noise norm (4.74) came out *larger* than the signal norm (3.06), so a
+    # latent carried barely more information than a draw from the prior. The
+    # energy score is then nearly as well satisfied by matching the marginal
+    # as the conditional, the head learns the marginal, and its samples decode
+    # to noise while the loss converges normally. That was the null in the
+    # first benchmark run, and it was this constant.
+    kl_weight: float = 1e-3
+    # Free bits: a per-dimension floor below which further KL reduction is not
+    # rewarded. It guards the opposite failure, a posterior collapsed onto a
+    # point mass, which would leave the energy score nothing to spread over.
+    kl_clamp: float = 0.5
 
     def __post_init__(self) -> None:
         if self.patch_size < 1:
