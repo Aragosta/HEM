@@ -1,0 +1,84 @@
+{
+  "config": {
+    "d_model": 128,
+    "patch_size": 4,
+    "latent_size": 32,
+    "vocab_size": 128,
+    "seq_len": 64,
+    "batch": 8,
+    "lr": 0.003,
+    "ae_steps": 800,
+    "calm_steps": 400,
+    "baseline_steps": 400
+  },
+  "training_wall_clock_seconds": {
+    "autoencoder": 90.95305633544922,
+    "calm": 82.13471841812134,
+    "baseline": 146.22385787963867
+  },
+  "final_train_loss_not_comparable": {
+    "calm_energy": 7.917418956756592,
+    "baseline_cross_entropy": 1.1458271741867065
+  },
+  "structure": {
+    "seq_len": 64,
+    "patch_size": 4,
+    "backbone_positions": {
+      "calm": 16,
+      "baseline": 64,
+      "ratio": 4
+    },
+    "parameters": {
+      "calm_trainable": 2017388,
+      "calm_backbone": 1496780,
+      "calm_energy_head": 339744,
+      "calm_frozen_codec": 1734720,
+      "baseline_total": 1513164,
+      "baseline_backbone": 1496780
+    }
+  },
+  "speed": {
+    "calm_ms_per_step": 207.1895005999977,
+    "baseline_ms_per_step": 385.67160859997784,
+    "speedup": 1.8614437868864777,
+    "calm_tokens_per_second": 2471.1676919791066,
+    "baseline_tokens_per_second": 1327.5542938164554
+  },
+  "generation": {
+    "new_tokens": 32,
+    "calm_sequential_steps": 8,
+    "baseline_sequential_steps": 32,
+    "calm_seconds": 0.2830815039999379,
+    "baseline_seconds": 1.6037926230001176,
+    "speedup": 5.665480083786997,
+    "calm_output_len": 40,
+    "baseline_output_len": 40
+  },
+  "quality": {
+    "brier_lm": {
+      "calm": 0.0,
+      "baseline": 0.24900791787031046
+    },
+    "brier_by_order": {
+      "calm": [
+        0.00833,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "baseline": [
+        0.4375,
+        0.29583,
+        0.24583,
+        0.12083
+      ]
+    },
+    "codec_ceiling_accuracy": 0.86328125,
+    "baseline_only": {
+      "cross_entropy_nats": 1.1750094890594482,
+      "perplexity": 3.238173670914642,
+      "corpus_entropy_floor_nats": 1.2850593328475952
+    },
+    "note": "perplexity exists only for the baseline; CALM-K3 is likelihood-free, which is why BrierLM is the shared axis"
+  }
+}
