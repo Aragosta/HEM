@@ -120,7 +120,30 @@ transitions and repeated motifs, so there is something to learn.
 
 ## Results
 
-See `results/benchmark.json` and `results/RESULTS.md` for a run and its reading.
+Full numbers and their reading: `results/RESULTS.md`. One run, 3000 steps each,
+same backbone config, same corpus, same seed:
+
+| | CALM-K3 | baseline K3 |
+|---|---|---|
+| backbone positions / 64 tokens | **16** | 64 |
+| training ms/step | **195.0** | 436.6 |
+| generate 32 tokens | **8 steps, 0.26 s** | 32 steps, 1.45 s |
+| whole run incl. codec | **702 s** | 1217 s |
+| BrierLM | 0.124 | **0.297** |
+| perplexity | *does not exist* | 3.095 |
+| codec ceiling | 0.999 | n/a |
+
+The structural claims hold: 4× fewer positions, 2.24× training throughput,
+5.67× fewer sequential generation steps, and the whole CALM run — codec
+pre-training included — cost 58% of the baseline's wall clock.
+
+On quality the baseline wins at matched steps and it is not close at order 1
+(brier₁ 0.558 vs 0.154). Two caveats that `results/RESULTS.md` develops: the
+gap narrows monotonically with n-gram order (0.28 → 0.55 of the baseline as the
+window grows to patch size, which is the patch structure showing in the
+metric), and CALM had not converged — the diagnostic shows accuracy and brier₁
+still climbing when the budget ran out, while the baseline is done, sitting
+below the corpus's Markov-only entropy floor.
 
 ## Scope
 
